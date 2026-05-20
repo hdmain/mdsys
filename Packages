@@ -6,9 +6,9 @@ Installed-Size: 167
 Depends: libncurses6 (>= 6), systemd, less
 Filename: pool/main/mdsys_0.2.0_amd64.deb
 Size: 65942
-MD5sum: c4f5b935721e4fe340ebf55260d1d99b
-SHA1: e893cc074617029ab25c9c098246f55b1554edb2
-SHA256: 2e22fc719826bd33094a6df4fcde89e60e30170a69cb11a29699e2600d12b975
+MD5sum: 4d1e4ff9f1b995728c64440057c39c89
+SHA1: 7e0355ef5ae827285df611d027041bac9f0f5268
+SHA256: 9bbedd081364250bcf1412f8d4aae4baacc929726eb79bb73edd38bf5b029b83
 Section: admin
 Priority: optional
 Description: TUI systemd service manager for Linux/WSL
