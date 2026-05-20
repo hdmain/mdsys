@@ -1,0 +1,118 @@
+name: Build & Publish apt repo
+
+on:
+  push:
+    branches: [main]
+    tags:     ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages:    write
+  id-token: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libncurses-dev dpkg-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Package (CPack → .deb)
+        run: cd build && cpack -G DEB
+
+      - name: Find .deb
+        id: deb
+        run: |
+          path=$(ls build/*.deb | head -1)
+          echo "path=$path"         >> $GITHUB_OUTPUT
+          echo "name=$(basename $path)" >> $GITHUB_OUTPUT
+
+      # On version tags also create a GitHub Release and attach the .deb
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.deb.outputs.path }}
+
+      # ── Update apt repository on gh-pages ────────────────────────────────
+      - name: Checkout gh-pages (or create it)
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+          # Create the branch if it doesn't exist yet
+        continue-on-error: true
+
+      - name: Init gh-pages if missing
+        run: |
+          if [ ! -d gh-pages ]; then
+            mkdir gh-pages
+            cd gh-pages
+            git init
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+            git checkout --orphan gh-pages
+          fi
+
+      - name: Copy .deb into pool
+        run: |
+          mkdir -p gh-pages/pool/main
+          cp ${{ steps.deb.outputs.path }} gh-pages/pool/main/
+
+      - name: Generate Packages index
+        run: |
+          cd gh-pages
+          dpkg-scanpackages --multiversion pool/ > Packages
+          gzip -k -f Packages
+
+      - name: Generate Release file
+        run: |
+          cd gh-pages
+          cat > Release <<EOF
+          Origin: mdsys
+          Label: mdsys
+          Suite: stable
+          Codename: stable
+          Architectures: amd64
+          Components: main
+          Description: mdsys apt repository
+          EOF
+          apt-ftparchive release . >> Release || true
+
+      - name: Add install instructions page
+        run: |
+          cat > gh-pages/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>mdsys apt repository</title>
+          <style>body{font-family:monospace;max-width:720px;margin:40px auto;background:#0d1117;color:#c9d1d9}
+          h1{color:#58a6ff}pre{background:#161b22;padding:16px;border-radius:6px;overflow-x:auto}
+          code{color:#79c0ff}</style></head>
+          <body>
+          <h1>mdsys — systemd TUI manager</h1>
+          <p>Install via apt:</p>
+          <pre>echo "deb [trusted=yes] https://hdmain.github.io/mdsys ./" \
+            | sudo tee /etc/apt/sources.list.d/mdsys.list
+          sudo apt update
+          sudo apt install mdsys</pre>
+          <p>Source: <a href="https://github.com/hdmain/mdsys" style="color:#58a6ff">github.com/hdmain/mdsys</a></p>
+          </body></html>
+          EOF
+
+      - name: Commit & push gh-pages
+        run: |
+          cd gh-pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "apt repo: ${{ steps.deb.outputs.name }}"
+          git push origin HEAD:gh-pages --force

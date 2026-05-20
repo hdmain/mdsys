@@ -1,41 +1,45 @@
 # mdsys
 
-`mdsys` is a terminal UI (TUI) manager for `systemd --user` services on Linux/WSL.
-It displays your user services, status, and memory usage, and lets you control services from the keyboard.
+A terminal UI (TUI) manager for `systemd` services on Linux/WSL.  
+Displays user or system services with status, RAM usage, and lets you control them from the keyboard.
 
-## Features
-
-- Lists user services from `systemctl --user`
-- Shows active state, sub-state, and current RAM usage (`MemoryCurrent`)
-- Details screen for a selected service (PID, start time, description)
-- Quick actions:
-  - `Enter`: open service details / return
-  - `R`: restart selected service
-  - `S`: start selected service
-  - `K`: stop selected service
-  - `U`: refresh list
-  - `Q`: quit
-
-## Build (WSL/Linux)
-
-Install dependencies:
+## Install via apt
 
 ```bash
+echo "deb [trusted=yes] https://hdmain.github.io/mdsys ./" \
+  | sudo tee /etc/apt/sources.list.d/mdsys.list
 sudo apt update
-sudo apt install -y build-essential cmake libncurses-dev
+sudo apt install mdsys
 ```
 
-Build:
+Then run:
 
 ```bash
-cmake -S . -B build
+mdsys
+```
+
+## Build from source
+
+**Dependencies (Ubuntu/Debian):**
+
+```bash
+sudo apt install build-essential cmake libncurses-dev
+```
+
+**Build:**
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+./build/mdsys
 ```
 
-Run:
+**Build a .deb package:**
 
 ```bash
-./build/mdsys
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cd build && cpack -G DEB
 ```
 
 ## WSL notes
@@ -47,8 +51,37 @@ Make sure systemd is enabled in WSL:
    [boot]
    systemd=true
    ```
-2. Restart WSL from Windows:
+2. Restart WSL:
    ```powershell
    wsl --shutdown
    ```
-3. Start WSL again and run `mdsys`.
+
+## Keybindings
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `W` / `J` | Navigate |
+| `Enter` | Open service details |
+| `R` | Restart selected service |
+| `S` | Start selected service |
+| `K` | Stop selected service |
+| `P` | Pin / unpin (persisted to `~/.config/mdsys/pinned`) |
+| `C` | Open console log (`journalctl … \| less`) |
+| `Tab` | Toggle system ↔ user mode |
+| `U` | Refresh list |
+| `Q` | Quit |
+
+## Features
+
+- Lists system or user services (`systemctl` / `systemctl --user`)
+- Shows active state, sub-state, and live RAM (`MemoryCurrent`)
+- **Pinned** category — pin important services to the top; pins are saved across sessions
+- **Details** view — description, PID, memory, start timestamp
+- **Console** — opens `journalctl` output for the selected service in `less`
+- Animated loading screen
+- Color-coded TUI (green = active, dimmed = inactive, yellow = pinned)
+- Auto-detects real user when run as root
+
+## License
+
+MIT
