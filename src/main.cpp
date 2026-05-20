@@ -3,6 +3,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <cerrno>
+#include <climits>
 
 #include <algorithm>
 #include <atomic>
@@ -507,7 +509,143 @@ static void drawLoadingScreen(int frame, int W, int H) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-int main() {
+// ---------------------------------------------------------------------------
+// Service registration  (mdsys <program> <name>)
+// ---------------------------------------------------------------------------
+static void mkdirP(const std::string& path) {
+    // Create each path component in turn (simple iterative mkdir -p).
+    for (std::size_t pos = 1; pos <= path.size(); ++pos) {
+        if (pos == path.size() || path[pos] == '/') {
+            std::string part = path.substr(0, pos);
+            mkdir(part.c_str(), 0755);  // ignore EEXIST
+        }
+    }
+}
+
+static int registerService(const std::string& progArg, const std::string& rawName) {
+    // Strip a trailing ".service" if the user accidentally typed it.
+    std::string name = rawName;
+    if (name.size() > 8 && name.substr(name.size() - 8) == ".service")
+        name = name.substr(0, name.size() - 8);
+
+    // ── Resolve executable to an absolute path ───────────────────────────
+    char resolvedExec[PATH_MAX] = {};
+    if (!realpath(progArg.c_str(), resolvedExec)) {
+        // realpath fails if the file doesn't exist yet; try CWD-relative path.
+        char cwd2[PATH_MAX] = {};
+        if (!getcwd(cwd2, sizeof(cwd2))) { perror("getcwd"); return 1; }
+        snprintf(resolvedExec, sizeof(resolvedExec), "%s/%s", cwd2, progArg.c_str());
+    }
+
+    // ── Working directory (where the command was run) ────────────────────
+    char cwd[PATH_MAX] = {};
+    if (!getcwd(cwd, sizeof(cwd))) { perror("getcwd"); return 1; }
+
+    // ── Effective username ───────────────────────────────────────────────
+    std::string username;
+    const char* sudoUser = getenv("SUDO_USER");
+    if (sudoUser && *sudoUser && std::string(sudoUser) != "root") {
+        username = sudoUser;
+    } else {
+        struct passwd* pw = getpwuid(getuid());
+        username = pw ? pw->pw_name : "root";
+    }
+
+    // ── Service file destination ─────────────────────────────────────────
+    bool asRoot = (getuid() == 0);
+    std::string serviceFilePath;
+    std::string systemctlFlag;
+
+    if (asRoot) {
+        serviceFilePath = "/etc/systemd/system/" + name + ".service";
+        systemctlFlag   = "";
+    } else {
+        const char* home = getenv("HOME");
+        if (!home) {
+            struct passwd* pw = getpwuid(getuid());
+            home = pw ? pw->pw_dir : nullptr;
+        }
+        if (!home) { fprintf(stderr, "error: cannot determine HOME\n"); return 1; }
+        std::string dir = std::string(home) + "/.config/systemd/user";
+        mkdirP(dir);
+        serviceFilePath = dir + "/" + name + ".service";
+        systemctlFlag   = "--user ";
+    }
+
+    // ── Check for overwrite ──────────────────────────────────────────────
+    if (access(serviceFilePath.c_str(), F_OK) == 0) {
+        fprintf(stderr,
+                "warning: %s already exists. Overwrite? [y/N] ",
+                serviceFilePath.c_str());
+        int ch = getchar();
+        if (ch != 'y' && ch != 'Y') { printf("Aborted.\n"); return 0; }
+    }
+
+    // ── Write unit file ──────────────────────────────────────────────────
+    FILE* f = fopen(serviceFilePath.c_str(), "w");
+    if (!f) {
+        fprintf(stderr, "error: cannot write %s: %s\n",
+                serviceFilePath.c_str(), strerror(errno));
+        return 1;
+    }
+    fprintf(f,
+        "[Unit]\n"
+        "Description=%s\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "WorkingDirectory=%s\n"
+        "ExecStart=%s\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "User=%s\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n",
+        name.c_str(), cwd, resolvedExec, username.c_str());
+    fclose(f);
+
+    // ── Reload systemd ───────────────────────────────────────────────────
+    std::string reloadCmd = "systemctl " + systemctlFlag + "daemon-reload";
+    (void)system(reloadCmd.c_str());
+
+    // ── Auto-pin the newly created service ───────────────────────────────
+    loadPinned();
+    g_pinned.insert(name + ".service");
+    savePinned();
+
+    // ── Print summary ─────────────────────────────────────────────────────
+    printf("\n");
+    printf("  Created:          %s\n",  serviceFilePath.c_str());
+    printf("  ExecStart:        %s\n",  resolvedExec);
+    printf("  WorkingDirectory: %s\n",  cwd);
+    printf("  User:             %s\n\n", username.c_str());
+    printf("  Start now:   systemctl %sstart  %s\n", systemctlFlag.c_str(), name.c_str());
+    printf("  Auto-start:  systemctl %senable %s\n", systemctlFlag.c_str(), name.c_str());
+    printf("  Check logs:  journalctl %s-u %s -f\n\n",
+           systemctlFlag.empty() ? "" : "--user ", name.c_str());
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    // ── Non-TUI mode: mdsys <program> <service-name> ─────────────────────
+    if (argc == 3) {
+        return registerService(argv[1], argv[2]);
+    }
+    if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+        printf("Usage:\n");
+        printf("  mdsys                      launch TUI service manager\n");
+        printf("  mdsys <program> <name>     register <program> as systemd service <name>\n");
+        printf("  mdsys -h                   show this help\n\n");
+        printf("Examples:\n");
+        printf("  mdsys ./server myserver    creates /etc/systemd/system/myserver.service\n");
+        return 0;
+    }
+
     g_user       = resolveUserContext();
     g_systemMode = (g_user.processUid == 0);
     loadPinned();
