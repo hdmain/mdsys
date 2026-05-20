@@ -13,16 +13,25 @@ permissions:
 
 jobs:
   build-deb:
-    runs-on: ubuntu-latest
+    # Ubuntu 20.04 ships glibc 2.31 — the binary runs on any system with glibc >= 2.31
+    # (Ubuntu 18.04+, Debian Buster+, CentOS 7+, most VPS providers).
+    runs-on: ubuntu-20.04
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libncurses-dev dpkg-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libncurses-dev libncurses5-dev dpkg-dev apt-utils
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        # -static-libgcc / -static-libstdc++ embed the C++ runtime into the binary
+        # so older distros that ship an older libstdc++ still work.
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
       - name: Build
         run: cmake --build build -j$(nproc)
