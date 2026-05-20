@@ -34,7 +34,7 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -lpthread"
 
       - name: Build
         run: cmake --build build -j$(nproc)

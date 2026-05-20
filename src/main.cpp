@@ -534,9 +534,10 @@ static int registerService(const std::string& progArg, const std::string& rawNam
         // realpath fails if the file doesn't exist yet; try CWD-relative path.
         char cwd2[PATH_MAX] = {};
         if (!getcwd(cwd2, sizeof(cwd2))) { perror("getcwd"); return 1; }
-        std::string fallback = std::string(cwd2) + "/" + progArg;
-        strncpy(resolvedExec, fallback.c_str(), PATH_MAX - 1);
-        resolvedExec[PATH_MAX - 1] = '\0';
+        // Build absolute path manually; truncate safely if somehow > PATH_MAX.
+        std::string abs = std::string(cwd2) + "/" + progArg;
+        abs.copy(resolvedExec, sizeof(resolvedExec) - 1);
+        resolvedExec[sizeof(resolvedExec) - 1] = '\0';
     }
 
     // ── Working directory (where the command was run) ────────────────────
