@@ -3,6 +3,8 @@
 A terminal UI (TUI) manager for `systemd` services on Linux/WSL.  
 Displays user or system services with status, RAM usage, and lets you control them from the keyboard.
 
+![mdsys preview](img/mdsyspreview.png)
+
 ## Install via apt
 
 ```bash
