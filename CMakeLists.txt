@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(mdsys VERSION 0.2.0 LANGUAGES CXX)
+project(mdsys VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ find_package(Curses REQUIRED)
 find_package(Threads REQUIRED)
 
 add_executable(mdsys src/main.cpp)
+target_compile_definitions(mdsys PRIVATE MDSYS_VERSION="${PROJECT_VERSION}")
 target_include_directories(mdsys PRIVATE ${CURSES_INCLUDE_DIR})
 target_link_libraries(mdsys PRIVATE ${CURSES_LIBRARIES} Threads::Threads)
 

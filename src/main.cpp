@@ -522,7 +522,8 @@ static void mkdirP(const std::string& path) {
     }
 }
 
-static int registerService(const std::string& progArg, const std::string& rawName) {
+static int registerService(const std::string& progArg, const std::string& rawName,
+                           const std::vector<std::string>& extraArgs = {}) {
     // Strip a trailing ".service" if the user accidentally typed it.
     std::string name = rawName;
     if (name.size() > 8 && name.substr(name.size() - 8) == ".service")
@@ -591,6 +592,10 @@ static int registerService(const std::string& progArg, const std::string& rawNam
                 serviceFilePath.c_str(), strerror(errno));
         return 1;
     }
+    // Build ExecStart: binary + any extra args passed through -b ... -n
+    std::string execStart = resolvedExec;
+    for (const auto& a : extraArgs) { execStart += ' '; execStart += a; }
+
     fprintf(f,
         "[Unit]\n"
         "Description=%s\n"
@@ -606,7 +611,7 @@ static int registerService(const std::string& progArg, const std::string& rawNam
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n",
-        name.c_str(), cwd, resolvedExec, username.c_str());
+        name.c_str(), cwd, execStart.c_str(), username.c_str());
     fclose(f);
 
     // ── Reload systemd ───────────────────────────────────────────────────
@@ -621,7 +626,7 @@ static int registerService(const std::string& progArg, const std::string& rawNam
     // ── Print summary ─────────────────────────────────────────────────────
     printf("\n");
     printf("  Created:          %s\n",  serviceFilePath.c_str());
-    printf("  ExecStart:        %s\n",  resolvedExec);
+    printf("  ExecStart:        %s\n",  execStart.c_str());
     printf("  WorkingDirectory: %s\n",  cwd);
     printf("  User:             %s\n\n", username.c_str());
     printf("  Start now:   systemctl %sstart  %s\n", systemctlFlag.c_str(), name.c_str());
@@ -634,19 +639,77 @@ static int registerService(const std::string& progArg, const std::string& rawNam
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+static void printHelp() {
+    printf(
+        "mdsys " MDSYS_VERSION " — systemd TUI service manager\n"
+        "\n"
+        "Usage:\n"
+        "  mdsys                              launch TUI\n"
+        "  mdsys <binary> <name>              register binary as a service (simple)\n"
+        "  mdsys -b <binary> -n <name>        register with flags (standard)\n"
+        "  mdsys -b <binary> [args] -n <name> register and pass args to the binary\n"
+        "  mdsys -h | --help                  show this help\n"
+        "  mdsys -v | --version               show version\n"
+        "\n"
+        "Flags:\n"
+        "  -b, --binary <path>   path to the binary\n"
+        "  -n, --name   <name>   service name (without .service)\n"
+        "  -h, --help            show this message\n"
+        "  -v, --version         show version\n"
+        "\n"
+        "Examples:\n"
+        "  mdsys ./myapp api-service\n"
+        "  mdsys -b ./myapp -n api-service\n"
+        "  mdsys -b ./myapp --api --port 8080 -n api-service\n"
+        "\n"
+        "Any flags between -b and -n are forwarded verbatim to ExecStart in the\n"
+        "generated .service file.\n"
+    );
+}
+
 int main(int argc, char* argv[]) {
-    // ── Non-TUI mode: mdsys <program> <service-name> ─────────────────────
-    if (argc == 3) {
-        return registerService(argv[1], argv[2]);
-    }
-    if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
-        printf("Usage:\n");
-        printf("  mdsys                      launch TUI service manager\n");
-        printf("  mdsys <program> <name>     register <program> as systemd service <name>\n");
-        printf("  mdsys -h                   show this help\n\n");
-        printf("Examples:\n");
-        printf("  mdsys ./server myserver    creates /etc/systemd/system/myserver.service\n");
-        return 0;
+    // ── CLI mode ──────────────────────────────────────────────────────────
+    if (argc > 1) {
+        std::string first = argv[1];
+
+        if (first == "-h" || first == "--help")    { printHelp(); return 0; }
+        if (first == "-v" || first == "--version") {
+            printf("mdsys " MDSYS_VERSION "\n"); return 0;
+        }
+
+        // Simple mode: mdsys <binary> <name>  (neither arg starts with '-')
+        if (argc == 3 && first[0] != '-') {
+            return registerService(argv[1], argv[2]);
+        }
+
+        // Standard mode: parse -b/--binary, -n/--name, collect the rest as extra args.
+        std::string binArg, nameArg;
+        std::vector<std::string> extraArgs;
+        bool ok = false;
+
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "-b" || a == "--binary") && i + 1 < argc) {
+                binArg = argv[++i];
+            } else if ((a == "-n" || a == "--name") && i + 1 < argc) {
+                nameArg = argv[++i];
+            } else if (a == "-h" || a == "--help") {
+                printHelp(); return 0;
+            } else if (a == "-v" || a == "--version") {
+                printf("mdsys " MDSYS_VERSION "\n"); return 0;
+            } else {
+                extraArgs.push_back(a);
+            }
+        }
+
+        if (!binArg.empty() && !nameArg.empty()) {
+            return registerService(binArg, nameArg, extraArgs);
+        }
+
+        // Unrecognised combination — show help and exit with error.
+        fprintf(stderr, "error: missing -b or -n flag.\n\n");
+        printHelp();
+        return 1;
     }
 
     g_user       = resolveUserContext();
