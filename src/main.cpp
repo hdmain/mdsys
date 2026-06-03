@@ -33,6 +33,8 @@ enum : int {
     CP_ERR        = 7,
     CP_DETAIL_KEY = 8,
     CP_STATUS_OK  = 9,
+    CP_CHART_RAM  = 10,
+    CP_CHART_CPU  = 11,
 };
 
 static void initColors() {
@@ -47,6 +49,8 @@ static void initColors() {
     init_pair(CP_ERR,        COLOR_RED,    -1);
     init_pair(CP_DETAIL_KEY, COLOR_YELLOW, -1);
     init_pair(CP_STATUS_OK,  COLOR_GREEN,  -1);
+    init_pair(CP_CHART_RAM,  COLOR_GREEN,  -1);
+    init_pair(CP_CHART_CPU,  COLOR_CYAN,   -1);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +185,105 @@ static std::string fmtMem(unsigned long long b) {
 
 static std::string pfx()  { return g_systemMode ? "" : g_user.userSessionPrefix; }
 static std::string flag() { return g_systemMode ? "" : "--user "; }
+
+// ---------------------------------------------------------------------------
+// Live service statistics (details view, 0.2s refresh)
+// ---------------------------------------------------------------------------
+struct LiveStats {
+    static constexpr std::size_t kMaxHistory = 80;
+    std::vector<double>          memHistory;   // bytes
+    std::vector<double>          cpuHistory;   // percent 0-100
+    unsigned long long           lastCpuNsec = 0;
+    bool                         haveCpuBaseline = false;
+    std::chrono::steady_clock::time_point lastSample{};
+};
+
+static void pushHistory(std::vector<double>& hist, double v) {
+    hist.push_back(v);
+    if (hist.size() > LiveStats::kMaxHistory)
+        hist.erase(hist.begin());
+}
+
+static double historyMax(const std::vector<double>& hist, double floorVal) {
+    double m = floorVal;
+    for (double v : hist) m = std::max(m, v);
+    return m > 0 ? m : floorVal;
+}
+
+static void sampleServiceStats(const std::string& unit, LiveStats& st,
+                               double& memBytes, double& cpuPct) {
+    memBytes = 0;
+    cpuPct   = 0;
+
+    int ec = 0;
+    std::string out = runCmd(pfx() + "systemctl " + flag() + "show " + shellQ(unit) +
+        " --property=MemoryCurrent --property=CPUUsageNSec 2>&1", &ec);
+    if (ec) return;
+
+    unsigned long long cpuNsec = 0;
+    std::istringstream ps(out);
+    std::string pl;
+    while (std::getline(ps, pl)) {
+        auto val = [&](const char* k) {
+            std::size_t kl = strlen(k);
+            return (pl.size() > kl && pl.substr(0, kl) == k) ? trim(pl.substr(kl)) : std::string();
+        };
+        std::string v;
+        if (!(v = val("MemoryCurrent=")).empty() && v != "[not set]")
+            memBytes = (double)strtoull(v.c_str(), nullptr, 10);
+        else if (!(v = val("CPUUsageNSec=")).empty() && v != "[not set]")
+            cpuNsec = strtoull(v.c_str(), nullptr, 10);
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (st.haveCpuBaseline) {
+        auto dtUs = std::chrono::duration_cast<std::chrono::microseconds>(now - st.lastSample).count();
+        if (dtUs > 0 && cpuNsec >= st.lastCpuNsec) {
+            unsigned long long delta = cpuNsec - st.lastCpuNsec;
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu < 1) ncpu = 1;
+            cpuPct = 100.0 * (double)delta / ((double)dtUs * 1000.0 * (double)ncpu);
+            if (cpuPct > 100.0 * (double)ncpu) cpuPct = 100.0 * (double)ncpu;
+        }
+    }
+    st.lastCpuNsec       = cpuNsec;
+    st.lastSample        = now;
+    st.haveCpuBaseline   = true;
+
+    pushHistory(st.memHistory, memBytes);
+    pushHistory(st.cpuHistory, cpuPct);
+}
+
+static void drawHistoryChart(int topRow, int leftCol, int chartW, int chartH,
+                             const std::vector<double>& hist, double maxVal,
+                             const char* label, int colorPair) {
+    if (chartW < 4) return;
+    if (maxVal < 1e-6) maxVal = 1.0;
+
+    attron(COLOR_PAIR(colorPair) | A_BOLD);
+    mvprintw(topRow, leftCol, "%s", label);
+    attroff(COLOR_PAIR(colorPair) | A_BOLD);
+
+    int n = (int)hist.size();
+    int start = std::max(0, n - chartW);
+    int cols  = std::min(chartW, n - start);
+
+    for (int row = 0; row < chartH; ++row) {
+        int y = topRow + 1 + row;
+        mvaddch(y, leftCol, '|');
+        for (int c = 0; c < chartW; ++c) {
+            char ch = ' ';
+            if (c < cols) {
+                double v = hist[(std::size_t)start + (std::size_t)c] / maxVal;
+                v = std::clamp(v, 0.0, 1.0);
+                int level = (int)(v * chartH + 0.999);
+                level = std::clamp(level, 0, chartH);
+                if (chartH - row <= level) ch = '#';
+            }
+            mvaddch(y, leftCol + 1 + c, ch);
+        }
+    }
+}
 
 static std::vector<Service> loadServices(std::string& err) {
     err.clear();
@@ -381,10 +484,10 @@ static void drawList(const std::vector<Service>& svcs,
 // Details view
 // ---------------------------------------------------------------------------
 static void drawDetails(const Service& s, int width, int height,
-                        const std::string& msg, const std::string& err) {
+                        const std::string& msg, const std::string& err,
+                        LiveStats& stats) {
     bool pinned = g_pinned.count(s.unit) > 0;
 
-    // Sub-header
     attron(A_BOLD);
     mvprintw(1, 2, "Service details");
     attroff(A_BOLD);
@@ -404,8 +507,43 @@ static void drawDetails(const Service& s, int width, int height,
     kv(8,  "Substate:",    s.subState);
     kv(9,  "Main PID:",    (s.mainPid.empty() || s.mainPid == "0") ? "-" : s.mainPid);
     kv(10, "Memory:",      s.memBytes == 0 ? "-" : fmtMem(s.memBytes));
-    kv(11, "Started at:",  s.startedAt);
-    kv(12, "Pinned:",      pinned ? "yes [*] (P to unpin)" : "no  (P to pin)");
+
+    double liveMem = 0, liveCpu = 0;
+    sampleServiceStats(s.unit, stats, liveMem, liveCpu);
+
+    int chartLeft = 4;
+    int chartW    = std::max(10, width - chartLeft - 2);
+    int chartH    = 4;
+    int statsRow  = 12;
+    int ramTop    = statsRow + 1;
+    int cpuTop    = ramTop + chartH + 1;
+    int bottomLim = height - 4;
+    if (cpuTop + chartH > bottomLim)
+        chartH = std::max(2, (bottomLim - ramTop - 1) / 2);
+    cpuTop = ramTop + chartH + 1;
+
+    attron(A_BOLD);
+    mvprintw(statsRow, chartLeft, "Live stats (0.2s):");
+    attroff(A_BOLD);
+    mvprintw(statsRow, chartLeft + 20,
+             "CPU %5.1f   RAM %s",
+             liveCpu,
+             liveMem > 0 ? fmtMem((unsigned long long)liveMem).c_str() : "-");
+
+    double memMax = historyMax(stats.memHistory, liveMem > 0 ? liveMem : 1024.0);
+    double cpuMax = historyMax(stats.cpuHistory, 10.0);
+    cpuMax        = std::max(cpuMax, 100.0);
+
+    drawHistoryChart(ramTop, chartLeft, chartW, chartH, stats.memHistory, memMax,
+                     "RAM", CP_CHART_RAM);
+    drawHistoryChart(cpuTop, chartLeft, chartW, chartH, stats.cpuHistory, cpuMax,
+                     "CPU", CP_CHART_CPU);
+
+    int metaRow = cpuTop + chartH + 1;
+    if (metaRow < height - 3) {
+        kv(metaRow,     "Started at:", s.startedAt);
+        kv(metaRow + 1, "Pinned:", pinned ? "yes [*] (P to unpin)" : "no  (P to pin)");
+    }
 
     mvhline(height - 2, 0, ACS_HLINE, width);
     if (!err.empty()) {
@@ -759,6 +897,7 @@ int main(int argc, char* argv[]) {
 
     int  selSvc     = svcs.empty() ? 0 : rows[0].kind == RowKind::Service ? rows[0].svcIdx : nextSvc(rows, 0, 0);
     bool inDetails  = false;
+    LiveStats liveStats;
 
     auto reload = [&](const std::string& newMsg = "") {
         // Show loading animation while reloading.
@@ -796,7 +935,7 @@ int main(int argc, char* argv[]) {
             mvprintw(7, 2, "TAB: toggle system/user    U: refresh    Q: quit");
         } else {
             if (inDetails) {
-                drawDetails(svcs[selSvc], W, H - 1, msg, err);
+                drawDetails(svcs[selSvc], W, H - 1, msg, err, liveStats);
             } else {
                 drawList(svcs, rows, selSvc, W, H - 1, msg, err);
             }
@@ -805,14 +944,23 @@ int main(int argc, char* argv[]) {
         drawKeybindBar(H - 1, W, inDetails);
         refresh();
 
+        if (inDetails)
+            timeout(200);
+        else
+            timeout(-1);
+
         int ch = getch();
+        if (ch == ERR && inDetails)
+            continue;
 
         if (ch == 'q' || ch == 'Q') break;
 
         // Tab: toggle system / user mode
         if (ch == '\t') {
             g_systemMode = !g_systemMode;
-            inDetails = false; selSvc = 0;
+            inDetails = false;
+            liveStats = LiveStats{};
+            selSvc = 0;
             reload(std::string(g_systemMode ? "System" : "User") + " mode — " +
                    std::to_string(svcs.size()) + " service(s).");
             if (!svcs.empty()) selSvc = nextSvc(rows, 0, 0);
@@ -836,8 +984,10 @@ int main(int argc, char* argv[]) {
                 selSvc = nextSvc(rows, selSvc, -10);
             else if (ch == KEY_NPAGE)
                 selSvc = nextSvc(rows, selSvc,  10);
-            else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13)
+            else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) {
                 inDetails = true;
+                liveStats = LiveStats{};
+            }
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
                 if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
@@ -859,8 +1009,10 @@ int main(int argc, char* argv[]) {
                 else         { reload(); err = act + " FAILED (exit " + std::to_string(ec) + "): " + svcs[selSvc].unit; }
             }
         } else {
-            if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13 || ch == 27)
+            if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13 || ch == 27) {
                 inDetails = false;
+                liveStats = LiveStats{};
+            }
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
                 if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
