@@ -33,6 +33,7 @@ enum : int {
     CP_ERR        = 7,
     CP_DETAIL_KEY = 8,
     CP_STATUS_OK  = 9,
+    CP_CONSOLE    = 10,
 };
 
 static void initColors() {
@@ -40,6 +41,7 @@ static void initColors() {
     use_default_colors();
     init_pair(CP_TITLEBAR,   COLOR_WHITE,  COLOR_BLUE);
     init_pair(CP_KEYBINDS,   COLOR_BLACK,  COLOR_WHITE);
+    init_pair(CP_CONSOLE,    COLOR_WHITE,  COLOR_BLACK);
     init_pair(CP_SVC_ACTIVE, COLOR_GREEN,  -1);
     init_pair(CP_SVC_DEAD,   COLOR_WHITE,  -1);
     init_pair(CP_PINSTAR,    COLOR_YELLOW, -1);
@@ -106,6 +108,16 @@ static UserContext resolveUserContext() {
 static UserContext          g_user;
 static bool                 g_systemMode = false;
 static std::set<std::string> g_pinned;
+
+// Bottom log panel (journalctl), toggled with C.
+struct ConsolePanel {
+    bool open = false;
+    std::string unit;
+    std::vector<std::string> lines;
+    int scroll = 0;       // index of first visible log line
+    bool stickBottom = true;  // follow newest lines when true
+};
+static ConsolePanel g_console;
 
 // ---------------------------------------------------------------------------
 // Pinned persistence  (~/.config/mdsys/pinned)
@@ -275,11 +287,27 @@ static void drawTitleBar(int width) {
 
 static void drawKeybindBar(int row, int width, bool inDetails) {
     attron(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
-    std::string kb = inDetails
-        ? "  ENTER:back  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh  Q:quit"
-        : "  UP/DOWN:select  ENTER:details  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh  Q:quit";
+    std::string kb;
+    if (g_console.open) {
+        kb = "  UP/DOWN/PgUp/PgDn:scroll log  C/Esc:close console  R:restart  S:start  K:stop  U:refresh  Q:quit";
+    } else if (inDetails) {
+        kb = "  ENTER:back  R:restart  S:start  K:stop  P:pin  C:console  TAB:mode  U:refresh  Q:quit";
+    } else {
+        kb = "  UP/DOWN:select  ENTER:details  R:restart  S:start  K:stop  P:pin  C:console  TAB:mode  U:refresh  Q:quit";
+    }
+    if ((int)kb.size() > width - 1) kb = kb.substr(0, std::max(0, width - 4)) + "...";
     mvprintw(row, 0, "%-*s", width, kb.c_str());
     attroff(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
+}
+
+// Rows reserved below the main list/details (status + optional console + keybind).
+static int consolePanelHeight(int termH) {
+    if (!g_console.open) return 0;
+    return std::clamp(termH / 3, 6, std::max(6, termH - 8));
+}
+
+static int statusRowFor(int termH) {
+    return termH - 2 - consolePanelHeight(termH);
 }
 
 static void drawColHeaders(int row) {
@@ -292,22 +320,28 @@ static void drawColHeaders(int row) {
 // ---------------------------------------------------------------------------
 // List view
 // ---------------------------------------------------------------------------
+static void drawStatusLine(int row, int width, const std::string& msg, const std::string& err) {
+    mvhline(row - 1, 0, ACS_HLINE, width);
+    if (!err.empty()) {
+        attron(COLOR_PAIR(CP_ERR) | A_BOLD);
+        mvprintw(row, 1, " ERROR: %-*s", width - 9, err.c_str());
+        attroff(COLOR_PAIR(CP_ERR) | A_BOLD);
+    } else {
+        attron(COLOR_PAIR(CP_STATUS_OK));
+        mvprintw(row, 1, " %-*s", width - 2, msg.c_str());
+        attroff(COLOR_PAIR(CP_STATUS_OK));
+    }
+}
+
 static void drawList(const std::vector<Service>& svcs,
                      const std::vector<DisplayRow>& rows,
-                     int selSvc, int width, int height,
+                     int selSvc, int width, int statusRow,
                      const std::string& msg, const std::string& err) {
-    // Layout:
-    //  row 0  : title bar
-    //  row 1  : column headers
-    //  row 2  : separator
-    //  rows 3..height-3 : list
-    //  row height-2 : status
-    //  row height-1 : keybind bar
     drawColHeaders(1);
     mvhline(2, 0, ACS_HLINE, width);
 
     int listTop    = 3;
-    int listBottom = height - 2;
+    int listBottom = statusRow;
     int visible    = std::max(1, listBottom - listTop);
 
     // Find display row index of selected service.
@@ -364,23 +398,13 @@ static void drawList(const std::vector<Service>& svcs,
         }
     }
 
-    // Status row
-    mvhline(height - 2, 0, ACS_HLINE, width);
-    if (!err.empty()) {
-        attron(COLOR_PAIR(CP_ERR) | A_BOLD);
-        mvprintw(height - 1, 1, " ERROR: %-*s", width - 9, err.c_str());
-        attroff(COLOR_PAIR(CP_ERR) | A_BOLD);
-    } else {
-        attron(COLOR_PAIR(CP_STATUS_OK));
-        mvprintw(height - 1, 1, " %-*s", width - 2, msg.c_str());
-        attroff(COLOR_PAIR(CP_STATUS_OK));
-    }
+    drawStatusLine(statusRow, width, msg, err);
 }
 
 // ---------------------------------------------------------------------------
 // Details view
 // ---------------------------------------------------------------------------
-static void drawDetails(const Service& s, int width, int height,
+static void drawDetails(const Service& s, int width, int statusRow,
                         const std::string& msg, const std::string& err) {
     bool pinned = g_pinned.count(s.unit) > 0;
 
@@ -407,14 +431,7 @@ static void drawDetails(const Service& s, int width, int height,
     kv(11, "Started at:",  s.startedAt);
     kv(12, "Pinned:",      pinned ? "yes [*] (P to unpin)" : "no  (P to pin)");
 
-    mvhline(height - 2, 0, ACS_HLINE, width);
-    if (!err.empty()) {
-        attron(COLOR_PAIR(CP_ERR) | A_BOLD);
-        mvprintw(height - 1, 1, " ERROR: %-*s", width - 9, err.c_str());
-        attroff(COLOR_PAIR(CP_ERR) | A_BOLD);
-    } else {
-        mvprintw(height - 1, 1, " %s", msg.c_str());
-    }
+    drawStatusLine(statusRow, width, msg, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -433,21 +450,92 @@ static int nextSvc(const std::vector<DisplayRow>& rows, int curSvc, int delta) {
 }
 
 // ---------------------------------------------------------------------------
-// Console log viewer  (suspends ncurses, runs journalctl | less, restores)
+// In-TUI console panel (journalctl at bottom of screen)
 // ---------------------------------------------------------------------------
-static void openConsole(const std::string& unit) {
-    // Build journalctl command.  System mode uses no --user flag.
-    // We pipe through `less -R` so the user can scroll freely.
-    std::string jcmd = pfx() + "journalctl " + flag() +
-                       "-u " + shellQ(unit) + " -n 500 --no-pager 2>&1 | less -R";
+static std::string truncateLine(const std::string& line, int maxLen) {
+    if (maxLen < 4 || (int)line.size() <= maxLen) return line;
+    return line.substr(0, maxLen - 3) + "...";
+}
 
-    def_prog_mode();   // save ncurses terminal state
-    endwin();          // restore normal terminal
+static void loadConsoleLogs(const std::string& unit) {
+    g_console.lines.clear();
+    std::string cmd = pfx() + "journalctl " + flag() +
+                      "-u " + shellQ(unit) + " -n 300 --no-pager 2>&1";
+    std::istringstream ss(runCmd(cmd));
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        g_console.lines.push_back(line);
+    }
+    if (g_console.lines.empty())
+        g_console.lines.push_back("(no log output)");
+    g_console.unit = unit;
+    g_console.scroll = 0;
+    g_console.stickBottom = true;
+}
 
-    system(jcmd.c_str());
+static int consoleLogVisibleRows(int panelH) {
+    return std::max(1, panelH - 2);  // header + separator
+}
 
-    reset_prog_mode(); // restore ncurses state
-    refresh();         // repaint
+static void clampConsoleScroll(int visibleRows) {
+    int maxScroll = std::max(0, (int)g_console.lines.size() - visibleRows);
+    g_console.scroll = std::clamp(g_console.scroll, 0, maxScroll);
+    if (g_console.stickBottom)
+        g_console.scroll = maxScroll;
+}
+
+static void consoleScrollBy(int delta, int visibleRows) {
+    g_console.stickBottom = false;
+    g_console.scroll += delta;
+    clampConsoleScroll(visibleRows);
+}
+
+static void toggleConsole(const std::string& unit) {
+    if (g_console.open && g_console.unit == unit) {
+        g_console.open = false;
+        return;
+    }
+    loadConsoleLogs(unit);
+    g_console.open = true;
+}
+
+static void drawConsolePanel(int top, int height, int width) {
+    int logRows = consoleLogVisibleRows(height);
+    clampConsoleScroll(logRows);
+
+    attron(COLOR_PAIR(CP_CONSOLE));
+    for (int y = top; y < top + height; ++y)
+        for (int x = 0; x < width; ++x)
+            mvaddch(y, x, ' ');
+    attroff(COLOR_PAIR(CP_CONSOLE));
+
+    mvhline(top, 0, ACS_HLINE, width);
+    attron(COLOR_PAIR(CP_CONSOLE) | A_BOLD);
+    std::string title = " LOG: " + g_console.unit + " ";
+    mvprintw(top + 1, 0, "%s", title.c_str());
+    mvhline(top + 1, (int)title.size(), ACS_HLINE, width - (int)title.size());
+
+    int logTop = top + 2;
+    for (int i = 0; i < logRows; ++i) {
+        int idx = g_console.scroll + i;
+        std::string text = idx < (int)g_console.lines.size()
+            ? truncateLine(g_console.lines[idx], width)
+            : "";
+        attron(COLOR_PAIR(CP_CONSOLE));
+        mvprintw(logTop + i, 0, "%-*s", width, text.c_str());
+        attroff(COLOR_PAIR(CP_CONSOLE));
+    }
+
+    int maxScroll = std::max(0, (int)g_console.lines.size() - logRows);
+    std::string hint = " lines " + std::to_string(g_console.scroll + 1) + "-" +
+        std::to_string(std::min((int)g_console.lines.size(), g_console.scroll + logRows)) +
+        "/" + std::to_string(g_console.lines.size());
+    if (g_console.scroll >= maxScroll) hint += " (end)";
+    attron(COLOR_PAIR(CP_CONSOLE) | A_DIM);
+    mvprintw(top + 1, std::max((int)title.size(), width - (int)hint.size()), "%s", hint.c_str());
+    attroff(COLOR_PAIR(CP_CONSOLE) | A_DIM);
+    attroff(A_BOLD);
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +877,10 @@ int main(int argc, char* argv[]) {
 
         drawTitleBar(W);
 
+        const int statusRow = statusRowFor(H);
+        const int consoleH  = consolePanelHeight(H);
+        const int consoleTop = statusRow + 1;
+
         if (svcs.empty()) {
             mvhline(2, 0, ACS_HLINE, W);
             mvprintw(4, 2, "No services found.");
@@ -796,11 +888,14 @@ int main(int argc, char* argv[]) {
             mvprintw(7, 2, "TAB: toggle system/user    U: refresh    Q: quit");
         } else {
             if (inDetails) {
-                drawDetails(svcs[selSvc], W, H - 1, msg, err);
+                drawDetails(svcs[selSvc], W, statusRow, msg, err);
             } else {
-                drawList(svcs, rows, selSvc, W, H - 1, msg, err);
+                drawList(svcs, rows, selSvc, W, statusRow, msg, err);
             }
         }
+
+        if (g_console.open && consoleH > 0)
+            drawConsolePanel(consoleTop, consoleH, W);
 
         drawKeybindBar(H - 1, W, inDetails);
         refresh();
@@ -809,10 +904,33 @@ int main(int argc, char* argv[]) {
 
         if (ch == 'q' || ch == 'Q') break;
 
+        const int logVisible = consoleLogVisibleRows(consoleH);
+
+        // Console panel: scroll or close (works in list and details view).
+        if (g_console.open) {
+            if (ch == 'c' || ch == 'C' || ch == 27) {
+                g_console.open = false;
+                continue;
+            }
+            if (ch == KEY_UP)
+                consoleScrollBy(-1, logVisible);
+            else if (ch == KEY_DOWN)
+                consoleScrollBy(1, logVisible);
+            else if (ch == KEY_PPAGE)
+                consoleScrollBy(-logVisible, logVisible);
+            else if (ch == KEY_NPAGE)
+                consoleScrollBy(logVisible, logVisible);
+            else if (ch != 'r' && ch != 'R' && ch != 's' && ch != 'S' &&
+                     ch != 'u' && ch != 'U' && ch != '\t' && ch != 'p' && ch != 'P')
+                continue;
+        }
+
         // Tab: toggle system / user mode
         if (ch == '\t') {
             g_systemMode = !g_systemMode;
-            inDetails = false; selSvc = 0;
+            inDetails = false;
+            g_console.open = false;
+            selSvc = 0;
             reload(std::string(g_systemMode ? "System" : "User") + " mode — " +
                    std::to_string(svcs.size()) + " service(s).");
             if (!svcs.empty()) selSvc = nextSvc(rows, 0, 0);
@@ -849,7 +967,7 @@ int main(int argc, char* argv[]) {
                 selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
             }
             else if (ch == 'c' || ch == 'C') {
-                openConsole(svcs[selSvc].unit);
+                toggleConsole(svcs[selSvc].unit);
             }
             else if (ch == 'r' || ch == 'R' || ch == 's' || ch == 'S' || ch == 'k' || ch == 'K') {
                 std::string act = (ch=='r'||ch=='R') ? "restart" : (ch=='s'||ch=='S') ? "start" : "stop";
@@ -857,9 +975,12 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
                 if (ec == 0) { err.clear(); reload(act + " OK: " + svcs[selSvc].unit); }
                 else         { reload(); err = act + " FAILED (exit " + std::to_string(ec) + "): " + svcs[selSvc].unit; }
+                if (g_console.open) loadConsoleLogs(svcs[selSvc].unit);
             }
         } else {
-            if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13 || ch == 27)
+            if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13)
+                inDetails = false;
+            else if (ch == 27 && !g_console.open)
                 inDetails = false;
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
@@ -872,7 +993,7 @@ int main(int argc, char* argv[]) {
                 selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
             }
             else if (ch == 'c' || ch == 'C') {
-                openConsole(svcs[selSvc].unit);
+                toggleConsole(svcs[selSvc].unit);
             }
             else if (ch == 'r' || ch == 'R' || ch == 's' || ch == 'S' || ch == 'k' || ch == 'K') {
                 std::string act = (ch=='r'||ch=='R') ? "restart" : (ch=='s'||ch=='S') ? "start" : "stop";
@@ -880,6 +1001,7 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
                 if (ec == 0) { err.clear(); reload(act + " OK: " + svcs[selSvc].unit); }
                 else         { reload(); err = act + " FAILED (exit " + std::to_string(ec) + "): " + svcs[selSvc].unit; }
+                if (g_console.open) loadConsoleLogs(svcs[selSvc].unit);
             }
         }
     }
