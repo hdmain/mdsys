@@ -20,13 +20,13 @@ Package: mdsys
 Version: 0.2.1
 Architecture: amd64
 Maintainer: hdmain <noreply@github.com>
-Installed-Size: 1462
+Installed-Size: 1459
 Depends: libncurses6 (>= 6), systemd, less
 Filename: pool/main/mdsys_0.2.1_amd64.deb
-Size: 464648
-MD5sum: 43d5cd59486f8cda46cbf73acf085f6d
-SHA1: 70c2e3ff3b3146f26e8b3bcf3a78bee2cf1c9d4b
-SHA256: bcfaf7b4db6318efe658e21d48ec9a93f5791618e659ab0d39ab0bf0ce4a9bb6
+Size: 465088
+MD5sum: e774cedc37c3f09000c50bc56383fc63
+SHA1: ca3794b1be7ea72c1fd65290b20dc0d453051165
+SHA256: 4fc35831b72f6fb2a193305c7dca0b2c76b52c0533b9c78b802d20f831b520e5
 Section: admin
 Priority: optional
 Description: TUI systemd service manager for Linux/WSL
