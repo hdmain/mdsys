@@ -22,16 +22,29 @@ mdsys
 
 ## Register a program as a service
 
-```bash
-mdsys <program> <name>
-```
-
-Example — register a binary and immediately start it:
+**Binary (simple):**
 
 ```bash
 mdsys ./prot httpprot
-systemctl start  httpprot
-systemctl enable httpprot   # auto-start on boot
+```
+
+**Binary with flags:**
+
+```bash
+mdsys -b ./myapp --port 8080 -n api-service
+```
+
+**Command** (npm, python, etc.):
+
+```bash
+mdsys -c npm start -n discordbot
+```
+
+Then start and enable:
+
+```bash
+systemctl start  discordbot
+systemctl enable discordbot   # auto-start on boot
 ```
 
 This creates `/etc/systemd/system/httpprot.service` (or `~/.config/systemd/user/` when not root), reloads systemd, and pins the service to the top of the TUI automatically.

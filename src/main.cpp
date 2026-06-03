@@ -786,24 +786,68 @@ static void mkdirP(const std::string& path) {
     }
 }
 
-static int registerService(const std::string& progArg, const std::string& rawName,
-                           const std::vector<std::string>& extraArgs = {}) {
-    // Strip a trailing ".service" if the user accidentally typed it.
-    std::string name = rawName;
-    if (name.size() > 8 && name.substr(name.size() - 8) == ".service")
-        name = name.substr(0, name.size() - 8);
+static std::string systemdQuoteArg(const std::string& arg) {
+    if (arg.find_first_of(" \t\"\\") == std::string::npos) return arg;
+    std::string out = "\"";
+    for (char c : arg) {
+        if (c == '\\' || c == '"') out += '\\';
+        out += c;
+    }
+    return out + "\"";
+}
 
-    // ── Resolve executable to an absolute path ───────────────────────────
+static std::string buildExecStartFromBinary(const std::string& progArg,
+                                            const std::vector<std::string>& extraArgs) {
     char resolvedExec[PATH_MAX] = {};
     if (!realpath(progArg.c_str(), resolvedExec)) {
-        // realpath fails if the file doesn't exist yet; try CWD-relative path.
         char cwd2[PATH_MAX] = {};
-        if (!getcwd(cwd2, sizeof(cwd2))) { perror("getcwd"); return 1; }
-        // Build absolute path manually; truncate safely if somehow > PATH_MAX.
+        if (!getcwd(cwd2, sizeof(cwd2))) {
+            perror("getcwd");
+            return "";
+        }
         std::string abs = std::string(cwd2) + "/" + progArg;
         abs.copy(resolvedExec, sizeof(resolvedExec) - 1);
         resolvedExec[sizeof(resolvedExec) - 1] = '\0';
     }
+    std::string execStart = resolvedExec;
+    for (const auto& a : extraArgs) {
+        execStart += ' ';
+        execStart += systemdQuoteArg(a);
+    }
+    return execStart;
+}
+
+// Build ExecStart for -c mode (e.g. "npm start"). Prefer absolute path to argv[0].
+static std::string buildExecStartFromCommand(const std::vector<std::string>& parts) {
+    if (parts.empty()) return "";
+
+    std::string whichOut = trim(runCmd("command -v " + shellQ(parts[0]) + " 2>/dev/null"));
+    if (!whichOut.empty()) {
+        std::string execStart = whichOut;
+        for (std::size_t i = 1; i < parts.size(); ++i) {
+            execStart += ' ';
+            execStart += systemdQuoteArg(parts[i]);
+        }
+        return execStart;
+    }
+
+    std::string joined;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) joined += ' ';
+        joined += parts[i];
+    }
+    return "/bin/sh -c " + shellQ(joined);
+}
+
+static int registerServiceExec(const std::string& rawName, const std::string& execStart) {
+    if (execStart.empty()) {
+        fprintf(stderr, "error: empty ExecStart\n");
+        return 1;
+    }
+
+    std::string name = rawName;
+    if (name.size() > 8 && name.substr(name.size() - 8) == ".service")
+        name = name.substr(0, name.size() - 8);
 
     // ── Working directory (where the command was run) ────────────────────
     char cwd[PATH_MAX] = {};
@@ -856,10 +900,6 @@ static int registerService(const std::string& progArg, const std::string& rawNam
                 serviceFilePath.c_str(), strerror(errno));
         return 1;
     }
-    // Build ExecStart: binary + any extra args passed through -b ... -n
-    std::string execStart = resolvedExec;
-    for (const auto& a : extraArgs) { execStart += ' '; execStart += a; }
-
     fprintf(f,
         "[Unit]\n"
         "Description=%s\n"
@@ -900,6 +940,23 @@ static int registerService(const std::string& progArg, const std::string& rawNam
     return 0;
 }
 
+static int registerService(const std::string& progArg, const std::string& rawName,
+                           const std::vector<std::string>& extraArgs = {}) {
+    std::string execStart = buildExecStartFromBinary(progArg, extraArgs);
+    if (execStart.empty()) return 1;
+    return registerServiceExec(rawName, execStart);
+}
+
+static int registerServiceCommand(const std::vector<std::string>& commandParts,
+                                  const std::string& rawName) {
+    std::string execStart = buildExecStartFromCommand(commandParts);
+    if (execStart.empty()) {
+        fprintf(stderr, "error: empty command\n");
+        return 1;
+    }
+    return registerServiceExec(rawName, execStart);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -909,25 +966,29 @@ static void printHelp() {
         "\n"
         "Usage:\n"
         "  mdsys                              launch TUI\n"
-        "  mdsys <binary> <name>              register binary as a service (simple)\n"
-        "  mdsys -b <binary> -n <name>        register with flags (standard)\n"
-        "  mdsys -b <binary> [args] -n <name> register and pass args to the binary\n"
-        "  mdsys -h | --help                  show this help\n"
-        "  mdsys -v | --version               show version\n"
+        "  mdsys <binary> <name>                register binary (simple)\n"
+        "  mdsys -b <binary> -n <name>          register binary with flags\n"
+        "  mdsys -b <binary> [args] -n <name>   binary + extra args\n"
+        "  mdsys -c <cmd> [args] -n <name>      register shell command\n"
+        "  mdsys -h | --help                    show this help\n"
+        "  mdsys -v | --version                 show version\n"
         "\n"
         "Flags:\n"
-        "  -b, --binary <path>   path to the binary\n"
-        "  -n, --name   <name>   service name (without .service)\n"
-        "  -h, --help            show this message\n"
-        "  -v, --version         show version\n"
+        "  -b, --binary  <path>   path to a binary executable\n"
+        "  -c, --command           run a command (words until -n are the command)\n"
+        "  -n, --name    <name>   service name (without .service)\n"
+        "  -h, --help             show this message\n"
+        "  -v, --version          show version\n"
         "\n"
         "Examples:\n"
         "  mdsys ./myapp api-service\n"
         "  mdsys -b ./myapp -n api-service\n"
-        "  mdsys -b ./myapp --api --port 8080 -n api-service\n"
+        "  mdsys -b ./myapp --port 8080 -n api-service\n"
+        "  mdsys -c npm start -n discordbot\n"
+        "  mdsys -c python3 app.py --port 3000 -n myapp\n"
         "\n"
-        "Any flags between -b and -n are forwarded verbatim to ExecStart in the\n"
-        "generated .service file.\n"
+        "With -b, tokens between -b and -n (except flags) are passed to the binary.\n"
+        "With -c, tokens after -c until -n form the command (resolved via PATH).\n"
     );
 }
 
@@ -946,32 +1007,71 @@ int main(int argc, char* argv[]) {
             return registerService(argv[1], argv[2]);
         }
 
-        // Standard mode: parse -b/--binary, -n/--name, collect the rest as extra args.
+        // Standard mode: -b <binary> [args] -n <name>  or  -c <cmd> [args] -n <name>
+        enum class RegMode { None, Binary, Command };
+        RegMode mode = RegMode::None;
         std::string binArg, nameArg;
         std::vector<std::string> extraArgs;
-        bool ok = false;
+        std::vector<std::string> commandParts;
 
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
-            if ((a == "-b" || a == "--binary") && i + 1 < argc) {
+            if (a == "-b" || a == "--binary") {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "error: -b requires a path\n");
+                    printHelp();
+                    return 1;
+                }
+                if (mode == RegMode::Command) {
+                    fprintf(stderr, "error: use only one of -b or -c\n");
+                    return 1;
+                }
+                mode = RegMode::Binary;
                 binArg = argv[++i];
-            } else if ((a == "-n" || a == "--name") && i + 1 < argc) {
+            } else if (a == "-c" || a == "--command") {
+                if (mode == RegMode::Binary) {
+                    fprintf(stderr, "error: use only one of -b or -c\n");
+                    return 1;
+                }
+                mode = RegMode::Command;
+            } else if (a == "-n" || a == "--name") {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "error: -n requires a service name\n");
+                    printHelp();
+                    return 1;
+                }
                 nameArg = argv[++i];
             } else if (a == "-h" || a == "--help") {
                 printHelp(); return 0;
             } else if (a == "-v" || a == "--version") {
                 printf("mdsys " MDSYS_VERSION "\n"); return 0;
-            } else {
+            } else if (mode == RegMode::Command) {
+                commandParts.push_back(a);
+            } else if (mode == RegMode::Binary) {
                 extraArgs.push_back(a);
+            } else {
+                fprintf(stderr, "error: unexpected argument '%s' (use -b or -c)\n", a.c_str());
+                printHelp();
+                return 1;
             }
         }
 
-        if (!binArg.empty() && !nameArg.empty()) {
-            return registerService(binArg, nameArg, extraArgs);
+        if (!nameArg.empty()) {
+            if (mode == RegMode::Binary && !binArg.empty())
+                return registerService(binArg, nameArg, extraArgs);
+            if (mode == RegMode::Command && !commandParts.empty())
+                return registerServiceCommand(commandParts, nameArg);
+            if (mode == RegMode::Command)
+                fprintf(stderr, "error: -c requires a command before -n\n");
+            else if (mode == RegMode::Binary)
+                fprintf(stderr, "error: -b requires a binary path\n");
+            else
+                fprintf(stderr, "error: use -b or -c with -n\n");
+            printHelp();
+            return 1;
         }
 
-        // Unrecognised combination — show help and exit with error.
-        fprintf(stderr, "error: missing -b or -n flag.\n\n");
+        fprintf(stderr, "error: missing -n <name>\n\n");
         printHelp();
         return 1;
     }
