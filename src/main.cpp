@@ -193,47 +193,92 @@ static std::string flag() { return g_systemMode ? "" : "--user "; }
 // ---------------------------------------------------------------------------
 struct LiveStats {
     static constexpr std::size_t kMaxHistory = 256;
-    std::vector<double>          memHistory;   // bytes
-    std::vector<double>          cpuHistory;   // percent 0-100
+    static constexpr int         kSampleMs   = 200;
+    std::vector<double>          memHistory;
+    std::vector<double>          cpuHistory;
     unsigned long long           lastCpuNsec = 0;
     bool                         haveCpuBaseline = false;
     std::chrono::steady_clock::time_point lastSample{};
+    std::chrono::steady_clock::time_point nextSample{};
+    double                       lastMem = 0;
+    double                       lastCpu = 0;
+    double                       scaleMemMax = 1024.0 * 1024.0;
+    double                       scaleCpuMax = 100.0;
 };
 
 static void pushHistory(std::vector<double>& hist, double v) {
     hist.push_back(v);
-    if (hist.size() > LiveStats::kMaxHistory)
+    while (hist.size() > LiveStats::kMaxHistory)
         hist.erase(hist.begin());
 }
 
-static double historyMax(const std::vector<double>& hist, double floorVal) {
-    double m = floorVal;
-    for (double v : hist) m = std::max(m, v);
-    return m > 0 ? m : floorVal;
+static double smoothScale(double prev, double observed, double floorVal) {
+    const double target = std::max(observed * 1.12, floorVal);
+    if (prev < 1e-6) return target;
+    if (target > prev) return prev * 0.35 + target * 0.65;
+    return prev * 0.92 + target * 0.08;
 }
 
-static std::vector<double> resampleHistory(const std::vector<double>& hist, int width) {
+static std::vector<double> chartSamples(const std::vector<double>& hist, int width) {
     std::vector<double> out((std::size_t)std::max(1, width), 0.0);
     if (hist.empty()) return out;
     const int n = (int)hist.size();
     const int w = (int)out.size();
+    if (n == 1 || w <= 1) {
+        const double v = hist.back();
+        out.assign((std::size_t)std::max(1, w), v);
+        return out;
+    }
     for (int c = 0; c < w; ++c) {
-        int idx = (int)((double)(c + 1) / w * n) - 1;
-        idx = std::clamp(idx, 0, n - 1);
-        out[(std::size_t)c] = hist[(std::size_t)idx];
+        const double t = (double)c / (double)(w - 1);
+        const double pos = t * (double)(n - 1);
+        const int i0 = (int)pos;
+        const int i1 = std::min(i0 + 1, n - 1);
+        const double frac = pos - (double)i0;
+        out[(std::size_t)c] = hist[(std::size_t)i0] * (1.0 - frac) + hist[(std::size_t)i1] * frac;
     }
     return out;
 }
 
-static chtype chartLevelChar(int rowFromBottom, int barHeight, int plotH) {
-    if (barHeight <= 0) return ' ';
-    if (rowFromBottom >= barHeight) return ' ';
-    const int top = barHeight - 1;
-    if (rowFromBottom == top) return ACS_BLOCK;
-    if (rowFromBottom >= top - 1) return ACS_CKBOARD;
-    if (rowFromBottom >= top - 2) return ACS_S7;
-    if (rowFromBottom >= top - 3) return ACS_S3;
-    return ACS_S1;
+static int valueToRow(double v, double maxVal, int plotH) {
+    if (maxVal < 1e-9) maxVal = 1.0;
+    v = std::clamp(v / maxVal, 0.0, 1.0);
+    const int row = (int)(v * (double)(plotH - 1) + 0.5);
+    return plotH - 1 - std::clamp(row, 0, plotH - 1);
+}
+
+static void drawSeries(int plotY, int plotX, int plotW, int plotH,
+                       const std::vector<double>& samples, double maxVal, int colorPair) {
+    if (plotW < 1 || plotH < 1) return;
+
+    int prevX = -1, prevY = -1;
+    for (int x = 0; x < plotW; ++x) {
+        const int y = valueToRow(samples[(std::size_t)x], maxVal, plotH);
+        for (int row = y; row < plotH; ++row) {
+            const bool peak = (row == y);
+            attron(COLOR_PAIR(colorPair) | (peak ? A_BOLD : A_DIM));
+            mvaddch(plotY + row, plotX + x, peak ? '*' : ':');
+            attroff(COLOR_PAIR(colorPair) | (peak ? A_BOLD : A_DIM));
+        }
+        if (prevX >= 0) {
+            int x0 = prevX, y0 = prevY, x1 = x, y1 = y;
+            const int dx = std::abs(x1 - x0);
+            const int sx = x0 < x1 ? 1 : -1;
+            int err = dx - std::abs(y1 - y0);
+            int cx = x0, cy = y0;
+            while (true) {
+                attron(COLOR_PAIR(colorPair) | A_BOLD);
+                mvaddch(plotY + cy, plotX + cx, '*');
+                attroff(COLOR_PAIR(colorPair) | A_BOLD);
+                if (cx == x1 && cy == y1) break;
+                const int e2 = 2 * err;
+                if (e2 > -std::abs(y1 - y0)) { err -= std::abs(y1 - y0); cx += sx; }
+                if (e2 < dx) { err += dx; cy += (y0 < y1 ? 1 : -1); }
+            }
+        }
+        prevX = x;
+        prevY = y;
+    }
 }
 
 struct ChartRect { int x, y, w, h; };
@@ -285,88 +330,77 @@ static void drawPanelBorder(int y, int x, int w, int h, int colorPair) {
     attroff(COLOR_PAIR(colorPair));
 }
 
+static void clearRect(int y, int x, int w, int h) {
+    for (int r = 0; r < h; ++r)
+        for (int c = 0; c < w; ++c)
+            mvaddch(y + r, x + c, ' ');
+}
+
 static void drawPanelChart(const ChartRect& rc, const std::vector<double>& hist,
                            double maxVal, const char* title, const char* valueLine,
-                           int colorPair) {
-    if (rc.w < 8 || rc.h < 5) return;
+                           int colorPair, bool isCpu) {
+    if (rc.w < 10 || rc.h < 6) return;
     if (maxVal < 1e-9) maxVal = 1.0;
 
     drawPanelBorder(rc.y, rc.x, rc.w, rc.h, colorPair);
 
     attron(COLOR_PAIR(colorPair) | A_BOLD);
-    std::string hdr = std::string(" ") + title + "  " + valueLine + " ";
-    if ((int)hdr.size() > rc.w - 2) hdr = hdr.substr(0, (std::size_t)std::max(0, rc.w - 5)) + "... ";
-    mvprintw(rc.y, rc.x + 2, "%-*s", rc.w - 4, hdr.c_str());
+    std::string hdr = std::string(" ") + title + "  " + valueLine;
+    if ((int)hdr.size() > rc.w - 4) hdr = hdr.substr(0, (std::size_t)std::max(0, rc.w - 7)) + "...";
+    mvprintw(rc.y, rc.x + 1, "%-*s", rc.w - 2, hdr.c_str());
     attroff(COLOR_PAIR(colorPair) | A_BOLD);
 
-    const int plotX = rc.x + 1;
-    const int plotY = rc.y + 1;
-    const int plotW = rc.w - 2;
-    const int plotH = rc.h - 2;
-    if (plotW < 2 || plotH < 2) return;
+    const int axisW  = 5;
+    const int plotX  = rc.x + 1 + axisW;
+    const int plotY  = rc.y + 1;
+    const int plotW  = rc.w - 2 - axisW;
+    const int plotH  = rc.h - 2;
+    if (plotW < 4 || plotH < 3) return;
 
-    // Y-axis scale labels (max at top of plot, 0 at bottom).
-    attron(COLOR_PAIR(CP_CHART_GRID) | A_DIM);
-    char scaleTop[16];
-    if (std::strstr(title, "CPU") != nullptr)
-        snprintf(scaleTop, sizeof(scaleTop), "%.0f%%", maxVal);
-    else {
-        if (maxVal >= 1024.0 * 1024.0)
-            snprintf(scaleTop, sizeof(scaleTop), "%.1fM", maxVal / (1024.0 * 1024.0));
-        else if (maxVal >= 1024.0)
-            snprintf(scaleTop, sizeof(scaleTop), "%.0fK", maxVal / 1024.0);
-        else
-            snprintf(scaleTop, sizeof(scaleTop), "%.0f", maxVal);
+    clearRect(plotY, rc.x + 1, rc.w - 2, plotH);
+
+    char scaleTop[12], scaleMid[12];
+    if (isCpu) {
+        snprintf(scaleTop, sizeof(scaleTop), "%4.0f%%", maxVal);
+        snprintf(scaleMid, sizeof(scaleMid), "%4.0f%%", maxVal * 0.5);
+    } else if (maxVal >= 1024.0 * 1024.0) {
+        snprintf(scaleTop, sizeof(scaleTop), "%3.0fM", maxVal / (1024.0 * 1024.0));
+        snprintf(scaleMid, sizeof(scaleMid), "%3.0fM", maxVal * 0.5 / (1024.0 * 1024.0));
+    } else if (maxVal >= 1024.0) {
+        snprintf(scaleTop, sizeof(scaleTop), "%3.0fK", maxVal / 1024.0);
+        snprintf(scaleMid, sizeof(scaleMid), "%3.0fK", maxVal * 0.5 / 1024.0);
+    } else {
+        snprintf(scaleTop, sizeof(scaleTop), "%4.0f", maxVal);
+        snprintf(scaleMid, sizeof(scaleMid), "%4.0f", maxVal * 0.5);
     }
-    mvaddch(plotY, plotX, ACS_VLINE);
-    mvprintw(plotY, plotX + 1, "%s", scaleTop);
-    mvaddch(plotY + plotH - 1, plotX, ACS_VLINE);
-    mvaddch(plotY + plotH - 1, plotX + 1, '0');
+
+    attron(COLOR_PAIR(CP_CHART_GRID) | A_DIM);
+    mvprintw(plotY, rc.x + 1, "%s", scaleTop);
+    mvprintw(plotY + plotH / 2, rc.x + 1, "%s", scaleMid);
+    mvprintw(plotY + plotH - 1, rc.x + 1, "   0");
     attroff(COLOR_PAIR(CP_CHART_GRID) | A_DIM);
 
-    const int innerX = plotX + 5;
-    const int innerW = std::max(1, plotW - 5);
-    std::vector<double> innerSamples = resampleHistory(hist, innerW);
-
-    for (int py = 0; py < plotH; ++py) {
-        const int rowFromBottom = plotH - 1 - py;
-        const bool gridLine =
-            plotH >= 4 && (rowFromBottom == plotH / 4 || rowFromBottom == plotH / 2 ||
-                           rowFromBottom == (3 * plotH) / 4);
-
-        for (int px = 0; px < innerW; ++px) {
-            double v = innerSamples[(std::size_t)px] / maxVal;
-            v = std::clamp(v, 0.0, 1.0);
-            int barH = (int)(v * plotH + 0.85);
-            barH = std::clamp(barH, 0, plotH);
-
-            chtype ch = chartLevelChar(rowFromBottom, barH, plotH);
-            int attr = COLOR_PAIR(colorPair);
-            if (rowFromBottom >= barH) {
-                if (gridLine) {
-                    ch = ACS_HLINE;
-                    attr = COLOR_PAIR(CP_CHART_GRID) | A_DIM;
-                }
-            } else if (rowFromBottom < barH - 1) {
-                attr = COLOR_PAIR(colorPair) | A_DIM;
-            } else {
-                attr = COLOR_PAIR(colorPair) | A_BOLD;
-            }
-            mvaddch(plotY + py, innerX + px, ch | attr);
-        }
+    for (int gy = 1; gy <= 3; ++gy) {
+        const int row = plotY + (plotH * gy) / 4;
+        for (int gx = 0; gx < plotW; ++gx)
+            mvaddch(row, plotX + gx, ACS_HLINE | COLOR_PAIR(CP_CHART_GRID) | A_DIM);
     }
 
-    // Time arrow (newest on the right).
+    std::vector<double> samples = chartSamples(hist, plotW);
+    drawSeries(plotY, plotX, plotW, plotH, samples, maxVal, colorPair);
+
     attron(COLOR_PAIR(CP_CHART_GRID) | A_DIM);
-    mvaddch(rc.y + rc.h - 1, rc.x + rc.w - 3, ACS_RARROW);
+    mvaddch(rc.y + rc.h - 1, rc.x + rc.w - 2, ACS_RARROW);
     attroff(COLOR_PAIR(CP_CHART_GRID) | A_DIM);
 }
 
-static void sampleServiceStats(const std::string& unit, LiveStats& st,
-                               double& memBytes, double& cpuPct) {
-    memBytes = 0;
-    cpuPct   = 0;
+static void tickLiveStats(const std::string& unit, LiveStats& st) {
+    auto now = std::chrono::steady_clock::now();
+    if (st.nextSample.time_since_epoch().count() != 0 && now < st.nextSample)
+        return;
+    st.nextSample = now + std::chrono::milliseconds(LiveStats::kSampleMs);
 
+    double memBytes = 0, cpuPct = 0;
     int ec = 0;
     std::string out = runCmd(pfx() + "systemctl " + flag() + "show " + shellQ(unit) +
         " --property=MemoryCurrent --property=CPUUsageNSec 2>&1", &ec);
@@ -387,23 +421,28 @@ static void sampleServiceStats(const std::string& unit, LiveStats& st,
             cpuNsec = strtoull(v.c_str(), nullptr, 10);
     }
 
-    auto now = std::chrono::steady_clock::now();
     if (st.haveCpuBaseline) {
         auto dtUs = std::chrono::duration_cast<std::chrono::microseconds>(now - st.lastSample).count();
-        if (dtUs > 0 && cpuNsec >= st.lastCpuNsec) {
+        if (dtUs >= 50'000 && cpuNsec >= st.lastCpuNsec) {
             unsigned long long delta = cpuNsec - st.lastCpuNsec;
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
             if (ncpu < 1) ncpu = 1;
             cpuPct = 100.0 * (double)delta / ((double)dtUs * 1000.0 * (double)ncpu);
-            if (cpuPct > 100.0 * (double)ncpu) cpuPct = 100.0 * (double)ncpu;
+            cpuPct = std::clamp(cpuPct, 0.0, 100.0 * (double)ncpu);
         }
     }
-    st.lastCpuNsec       = cpuNsec;
-    st.lastSample        = now;
-    st.haveCpuBaseline   = true;
+    st.lastCpuNsec     = cpuNsec;
+    st.lastSample      = now;
+    st.haveCpuBaseline = true;
+    st.lastMem         = memBytes;
+    st.lastCpu         = cpuPct;
 
     pushHistory(st.memHistory, memBytes);
     pushHistory(st.cpuHistory, cpuPct);
+
+    st.scaleMemMax = smoothScale(st.scaleMemMax, memBytes, 512.0 * 1024.0);
+    st.scaleCpuMax = smoothScale(st.scaleCpuMax, cpuPct, 5.0);
+    st.scaleCpuMax = std::clamp(st.scaleCpuMax, 5.0, 100.0);
 }
 
 static std::vector<Service> loadServices(std::string& err) {
@@ -500,7 +539,7 @@ static void drawTitleBar(int width) {
 static void drawKeybindBar(int row, int width, bool inDetails) {
     attron(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
     std::string kb = inDetails
-        ? "  ENTER:back  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh  Q:quit"
+        ? "  ENTER/Q:back  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh"
         : "  UP/DOWN:select  ENTER:details  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh  Q:quit";
     mvprintw(row, 0, "%-*s", width, kb.c_str());
     attroff(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
@@ -614,8 +653,8 @@ static void drawDetails(const Service& s, int width, int height,
     attroff(A_BOLD);
     mvhline(2, 0, ACS_HLINE, width);
 
-    double liveMem = 0, liveCpu = 0;
-    sampleServiceStats(s.unit, stats, liveMem, liveCpu);
+    double liveMem = stats.lastMem;
+    double liveCpu = stats.lastCpu;
 
     // Compact header — frees vertical space for charts.
     std::string unit = s.unit;
@@ -647,12 +686,6 @@ static void drawDetails(const Service& s, int width, int height,
     const int chartAreaBottom = height - 3;
     ChartLayout layout        = computeChartLayout(width, height, chartAreaTop, chartAreaBottom);
 
-    double memMax = historyMax(stats.memHistory, liveMem > 0 ? liveMem : 1024.0);
-    memMax *= 1.08;
-    double cpuMax = historyMax(stats.cpuHistory, 5.0);
-    cpuMax        = std::max(cpuMax * 1.15, 8.0);
-    cpuMax        = std::min(cpuMax, 100.0);
-
     char ramVal[32], cpuVal[32];
     if (liveMem > 0)
         snprintf(ramVal, sizeof(ramVal), "%s", fmtMem((unsigned long long)liveMem).c_str());
@@ -660,8 +693,8 @@ static void drawDetails(const Service& s, int width, int height,
         snprintf(ramVal, sizeof(ramVal), "-");
     snprintf(cpuVal, sizeof(cpuVal), "%.1f%%", liveCpu);
 
-    drawPanelChart(layout.ram, stats.memHistory, memMax, "RAM", ramVal, CP_CHART_RAM);
-    drawPanelChart(layout.cpu, stats.cpuHistory, cpuMax, "CPU", cpuVal, CP_CHART_CPU);
+    drawPanelChart(layout.ram, stats.memHistory, stats.scaleMemMax, "RAM", ramVal, CP_CHART_RAM, false);
+    drawPanelChart(layout.cpu, stats.cpuHistory, stats.scaleCpuMax, "CPU", cpuVal, CP_CHART_CPU, true);
 
     if (chartAreaBottom < height - 2) {
         std::string meta = "Started: " + (s.startedAt.empty() ? "-" : s.startedAt);
@@ -1160,6 +1193,8 @@ int main(int argc, char* argv[]) {
             if (!err.empty()) { attron(COLOR_PAIR(CP_ERR)); mvprintw(5, 2, "%s", err.c_str()); attroff(COLOR_PAIR(CP_ERR)); }
             mvprintw(7, 2, "TAB: toggle system/user    U: refresh    Q: quit");
         } else {
+            if (inDetails)
+                tickLiveStats(svcs[selSvc].unit, liveStats);
             if (inDetails) {
                 drawDetails(svcs[selSvc], W, H - 1, msg, err, liveStats);
             } else {
@@ -1179,7 +1214,14 @@ int main(int argc, char* argv[]) {
         if (ch == ERR && inDetails)
             continue;
 
-        if (ch == 'q' || ch == 'Q') break;
+        if (ch == 'q' || ch == 'Q') {
+            if (inDetails) {
+                inDetails = false;
+                liveStats = LiveStats{};
+                continue;
+            }
+            break;
+        }
 
         // Tab: toggle system / user mode
         if (ch == '\t') {
@@ -1213,6 +1255,7 @@ int main(int argc, char* argv[]) {
             else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) {
                 inDetails = true;
                 liveStats = LiveStats{};
+                tickLiveStats(svcs[selSvc].unit, liveStats);
             }
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
