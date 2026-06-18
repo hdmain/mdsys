@@ -17,8 +17,7 @@ target_link_libraries(mdsys PRIVATE ${CURSES_LIBRARIES} Threads::Threads)
 include(GNUInstallDirs)
 install(TARGETS mdsys RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# ── CPack / DEB ──────────────────────────────────────────────────────────────
-set(CPACK_GENERATOR "DEB")
+# ── CPack (DEB + RPM) ───────────────────────────────────────────────────────
 set(CPACK_PACKAGE_NAME            "mdsys")
 set(CPACK_PACKAGE_VERSION         "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_CONTACT         "hdmain <noreply@github.com>")
@@ -29,10 +28,18 @@ set(CPACK_PACKAGE_DESCRIPTION
     "Features: service list with RAM usage, pin/unpin, restart/start/stop,\n"
     "live log viewer via journalctl, system/user mode toggle.")
 
-set(CPACK_DEBIAN_PACKAGE_SECTION    "admin")
-set(CPACK_DEBIAN_PACKAGE_PRIORITY   "optional")
-set(CPACK_DEBIAN_PACKAGE_DEPENDS    "libncurses6 (>= 6), systemd, less")
+# Debian / Ubuntu (.deb)
+set(CPACK_DEBIAN_PACKAGE_SECTION      "admin")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY     "optional")
+set(CPACK_DEBIAN_PACKAGE_DEPENDS      "libncurses6 (>= 6), systemd, less")
 set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
-set(CPACK_DEBIAN_FILE_NAME          "DEB-DEFAULT")
+set(CPACK_DEBIAN_FILE_NAME            "DEB-DEFAULT")
+
+# Fedora / AlmaLinux / CentOS (.rpm)
+set(CPACK_RPM_PACKAGE_GROUP       "Applications/System")
+set(CPACK_RPM_PACKAGE_LICENSE     "MIT")
+set(CPACK_RPM_PACKAGE_REQUIRES    "ncurses, systemd, less")
+set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
+set(CPACK_RPM_FILE_NAME           "RPM-DEFAULT")
 
 include(CPack)

@@ -5,13 +5,46 @@ Displays user or system services with status, RAM usage, and lets you control th
 
 ![mdsys preview](img/mdsyspreview.png)
 
-## Install via apt
+## Install
+
+### Debian / Ubuntu (apt)
 
 ```bash
 echo "deb [trusted=yes] https://hdmain.github.io/mdsys ./" \
   | sudo tee /etc/apt/sources.list.d/mdsys.list
 sudo apt update
 sudo apt install mdsys
+```
+
+### Fedora / AlmaLinux / CentOS (dnf)
+
+```bash
+sudo tee /etc/yum.repos.d/mdsys.repo <<'EOF'
+[mdsys]
+name=mdsys
+baseurl=https://hdmain.github.io/mdsys/rpm
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install mdsys
+```
+
+On CentOS 7 / older systems with `yum` only:
+
+```bash
+sudo yum install mdsys
+```
+
+### Arch Linux (pacman)
+
+```bash
+sudo tee -a /etc/pacman.conf <<'EOF'
+
+[mdsys]
+SigLevel = Optional TrustAll
+Server = https://hdmain.github.io/mdsys/arch/
+EOF
+sudo pacman -Sy mdsys
 ```
 
 Then run:
@@ -115,12 +148,14 @@ cmake --build build -j
 ./build/mdsys
 ```
 
-**Build a .deb package:**
+**Build packages:**
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-cd build && cpack -G DEB
+cd build && cpack -G DEB    # Debian/Ubuntu
+cd build && cpack -G RPM    # Fedora/Alma/CentOS
+cp packaging/arch/PKGBUILD . && makepkg -sf   # Arch Linux
 ```
 
 ## License

@@ -1,0 +1,23 @@
+# Build from repo root: cp packaging/arch/PKGBUILD . && makepkg -sf --noconfirm
+pkgname=mdsys
+pkgver=0.2.4
+pkgrel=1
+pkgdesc="TUI systemd service manager for Linux"
+arch=('x86_64')
+url="https://github.com/hdmain/mdsys"
+license=('MIT')
+depends=('ncurses' 'systemd' 'less')
+makedepends=('cmake' 'gcc')
+source=()
+options=('!debug')
+
+build() {
+  cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -lpthread"
+  cmake --build build -j"$(nproc)"
+}
+
+package() {
+  install -Dm755 build/mdsys "$pkgdir/usr/bin/mdsys"
+}
