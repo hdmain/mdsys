@@ -124,7 +124,7 @@ jobs:
       - name: Install repo tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev apt-utils createrepo-c pacman-contrib
+          sudo apt-get install -y dpkg-dev apt-utils createrepo-c
 
       - name: Publish apt repo (Debian/Ubuntu)
         run: |
@@ -154,8 +154,8 @@ jobs:
         run: |
           mkdir -p gh-pages/arch
           cp artifacts/arch/*.pkg.tar.zst gh-pages/arch/
-          cd gh-pages/arch
-          repo-add mdsys.db.tar.gz *.pkg.tar.zst
+          docker run --rm -v "$GITHUB_WORKSPACE/gh-pages/arch:/repo" archlinux:latest \
+            bash -c "pacman -Sy --noconfirm pacman-contrib && cd /repo && repo-add mdsys.db.tar.gz *.pkg.tar.zst"
 
       - name: Write install page
         run: |
