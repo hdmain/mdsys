@@ -12,12 +12,12 @@ source=()
 options=('!debug')
 
 build() {
-  cmake -S . -B build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -lpthread"
+  cd "$startdir"
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMDSYS_STATIC_LIBCXX=OFF
   cmake --build build -j"$(nproc)"
 }
 
 package() {
+  cd "$startdir"
   install -Dm755 build/mdsys "$pkgdir/usr/bin/mdsys"
 }

@@ -13,6 +13,12 @@ target_compile_definitions(mdsys PRIVATE MDSYS_VERSION="${PROJECT_VERSION}")
 target_include_directories(mdsys PRIVATE ${CURSES_INCLUDE_DIR})
 target_link_libraries(mdsys PRIVATE ${CURSES_LIBRARIES} Threads::Threads)
 
+# Static libgcc/libstdc++ on final link only (not during CMake compiler tests).
+option(MDSYS_STATIC_LIBCXX "Statically link libgcc/libstdc++" ON)
+if(MDSYS_STATIC_LIBCXX AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_link_options(mdsys PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
 # ── Install ──────────────────────────────────────────────────────────────────
 include(GNUInstallDirs)
 install(TARGETS mdsys RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
