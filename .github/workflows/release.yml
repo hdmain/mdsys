@@ -24,12 +24,11 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y git cmake libncurses-dev dpkg-dev apt-utils \
-                             build-essential libstdc++-static
+          apt-get install -y git cmake libncurses-dev dpkg-dev apt-utils build-essential
 
       - name: Build .deb
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMDSYS_STATIC_LIBCXX=OFF
           cmake --build build -j$(nproc)
           cd build && cpack -G DEB
 
