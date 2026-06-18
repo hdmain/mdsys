@@ -1,15 +1,41 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>mdsys apt repository</title>
-<style>body{font-family:monospace;max-width:720px;margin:40px auto;background:#0d1117;color:#c9d1d9}
-h1{color:#58a6ff}pre{background:#161b22;padding:16px;border-radius:6px;overflow-x:auto}
-code{color:#79c0ff}</style></head>
+<head>
+  <meta charset="utf-8">
+  <title>mdsys packages</title>
+  <style>
+    body{font-family:monospace;max-width:820px;margin:40px auto;background:#0d1117;color:#c9d1d9;line-height:1.5}
+    h1,h2{color:#58a6ff} pre{background:#161b22;padding:16px;border-radius:6px;overflow-x:auto}
+    a{color:#79c0ff}
+  </style>
+</head>
 <body>
-<h1>mdsys — systemd TUI manager</h1>
-<p>Install via apt:</p>
-<pre>echo "deb [trusted=yes] https://hdmain.github.io/mdsys ./" \
-  | sudo tee /etc/apt/sources.list.d/mdsys.list
-sudo apt update
-sudo apt install mdsys</pre>
-<p>Source: <a href="https://github.com/hdmain/mdsys" style="color:#58a6ff">github.com/hdmain/mdsys</a></p>
-</body></html>
+  <h1>mdsys — systemd TUI manager</h1>
+  <p>Source: <a href="https://github.com/hdmain/mdsys">github.com/hdmain/mdsys</a></p>
+
+  <h2>Debian / Ubuntu (apt)</h2>
+  <pre>echo "deb [trusted=yes] https://hdmain.github.io/mdsys ./" \
+    | sudo tee /etc/apt/sources.list.d/mdsys.list
+  sudo apt update
+  sudo apt install mdsys</pre>
+
+  <h2>Fedora / AlmaLinux / CentOS (dnf)</h2>
+  <pre>sudo tee /etc/yum.repos.d/mdsys.repo &lt;&lt;'REPO'
+  [mdsys]
+  name=mdsys
+  baseurl=https://hdmain.github.io/mdsys/rpm
+  enabled=1
+  gpgcheck=0
+  REPO
+  sudo dnf install mdsys</pre>
+
+  <h2>Arch Linux (pacman)</h2>
+  <pre>sudo tee -a /etc/pacman.conf &lt;&lt;'REPO'
+
+  [mdsys]
+  SigLevel = Optional TrustAll
+  Server = https://hdmain.github.io/mdsys/arch/
+  REPO
+  sudo pacman -Sy mdsys</pre>
+</body>
+</html>
