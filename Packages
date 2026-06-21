@@ -77,10 +77,10 @@ Maintainer: hdmain <noreply@github.com>
 Installed-Size: 150
 Depends: libncurses6 (>= 6), systemd, less
 Filename: pool/main/mdsys_0.2.4_amd64.deb
-Size: 59418
-MD5sum: 6fe102e3c38f1a402ef9c5704252e265
-SHA1: e8a3122dce8be61e8f2c0665422acac4659a684d
-SHA256: 757d5a50db33c20a3565706ca650444832e0d0d5743f39fcc65b5df30e813749
+Size: 59202
+MD5sum: ca18efa6fb52b677eec3db1422682218
+SHA1: b57cb65094967b169b6a3f4d49c7201858114ff9
+SHA256: 7bb4ae94e41f7eee4f1b401ce659e2da84307d2694e77ad3083d1c5d2fbcd25f
 Section: admin
 Priority: optional
 Description: TUI systemd service manager for Linux/WSL
