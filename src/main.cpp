@@ -106,6 +106,25 @@ static UserContext resolveUserContext() {
     return ctx;
 }
 
+static void mkdirP(const std::string& path) {
+    for (std::size_t pos = 1; pos <= path.size(); ++pos) {
+        if (pos == path.size() || path[pos] == '/') {
+            std::string part = path.substr(0, pos);
+            mkdir(part.c_str(), 0755);
+        }
+    }
+}
+
+static uid_t configOwnerUid() {
+    const char* sudoUid = getenv("SUDO_UID");
+    if (sudoUid) return (uid_t)strtoul(sudoUid, nullptr, 10);
+    uid_t uid = getuid();
+    if (uid != 0) return uid;
+    std::string name;
+    uid_t real = findRealUid(name);
+    return real ? real : uid;
+}
+
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
@@ -118,19 +137,38 @@ static std::set<std::string> g_pinned;
 // ---------------------------------------------------------------------------
 static std::string pinnedFilePath() {
     const char* xdgCfg = getenv("XDG_CONFIG_HOME");
-    std::string base = xdgCfg ? std::string(xdgCfg) : (std::string(getenv("HOME") ? getenv("HOME") : "/root") + "/.config");
-    return base + "/mdsys/pinned";
+    if (xdgCfg && xdgCfg[0] != '\0')
+        return std::string(xdgCfg) + "/mdsys/pinned";
+
+    struct passwd* pw = getpwuid(configOwnerUid());
+    std::string home = pw && pw->pw_dir ? pw->pw_dir : "/root";
+    return home + "/.config/mdsys/pinned";
 }
 
-static void savePinned() {
-    std::string path = pinnedFilePath();
-    // Ensure the directory exists (mkdir -p equivalent via sys/stat).
-    std::string dir = path.substr(0, path.rfind('/'));
-    mkdir(dir.c_str(), 0755);
+static bool savePinned(std::string* errOut = nullptr) {
+    const std::string path = pinnedFilePath();
+    const std::string dir  = path.substr(0, path.rfind('/'));
+    mkdirP(dir);
+
     FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
-    for (const auto& u : g_pinned) fprintf(f, "%s\n", u.c_str());
+    if (!f) {
+        if (errOut) *errOut = std::string("cannot write ") + path + ": " + strerror(errno);
+        return false;
+    }
+    for (const auto& u : g_pinned) {
+        if (fprintf(f, "%s\n", u.c_str()) < 0) {
+            if (errOut) *errOut = std::string("write failed: ") + path;
+            fclose(f);
+            return false;
+        }
+    }
+    if (fflush(f) != 0) {
+        if (errOut) *errOut = std::string("flush failed: ") + path;
+        fclose(f);
+        return false;
+    }
     fclose(f);
+    return true;
 }
 
 static void loadPinned() {
@@ -809,16 +847,6 @@ static void drawLoadingScreen(int frame, int W, int H) {
 // ---------------------------------------------------------------------------
 // Service registration  (mdsys <program> <name>)
 // ---------------------------------------------------------------------------
-static void mkdirP(const std::string& path) {
-    // Create each path component in turn (simple iterative mkdir -p).
-    for (std::size_t pos = 1; pos <= path.size(); ++pos) {
-        if (pos == path.size() || path[pos] == '/') {
-            std::string part = path.substr(0, pos);
-            mkdir(part.c_str(), 0755);  // ignore EEXIST
-        }
-    }
-}
-
 static std::string systemdQuoteArg(const std::string& arg) {
     if (arg.find_first_of(" \t\"\\") == std::string::npos) return arg;
     std::string out = "\"";
@@ -958,7 +986,11 @@ static int registerServiceExec(const std::string& rawName, const std::string& ex
     // ── Auto-pin the newly created service ───────────────────────────────
     loadPinned();
     g_pinned.insert(name + ".service");
-    savePinned();
+    {
+        std::string pinErr;
+        if (!savePinned(&pinErr))
+            fprintf(stderr, "warning: pin not saved: %s\n", pinErr.c_str());
+    }
 
     // ── Print summary ─────────────────────────────────────────────────────
     printf("\n");
@@ -1261,8 +1293,9 @@ int main(int argc, char* argv[]) {
                 const std::string& u = svcs[selSvc].unit;
                 if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
                 else                   { g_pinned.insert(u); msg = "Pinned: "   + u; }
-                savePinned();
-                err.clear();
+                std::string pinErr;
+                if (!savePinned(&pinErr)) { err = pinErr; msg.clear(); }
+                else err.clear();
                 svcs = loadServices(err);
                 rows = buildRows(svcs);
                 selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
@@ -1286,8 +1319,9 @@ int main(int argc, char* argv[]) {
                 const std::string& u = svcs[selSvc].unit;
                 if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
                 else                   { g_pinned.insert(u); msg = "Pinned: "   + u; }
-                savePinned();
-                err.clear();
+                std::string pinErr;
+                if (!savePinned(&pinErr)) { err = pinErr; msg.clear(); }
+                else err.clear();
                 svcs = loadServices(err);
                 rows = buildRows(svcs);
                 selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
