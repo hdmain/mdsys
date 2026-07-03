@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 
@@ -581,7 +582,7 @@ static void drawKeybindBar(int row, int width, bool inDetails) {
     attron(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
     std::string kb = inDetails
         ? "  ENTER/Q:back  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh"
-        : "  UP/DOWN:select  ENTER:details  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh  Q:quit";
+        : "  UP/DOWN:select  ENTER:details  F:find  R:restart  S:start  K:stop  P:pin  C:console  TAB:mode  U:refresh  Q:quit";
     mvprintw(row, 0, "%-*s", width, kb.c_str());
     attroff(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
 }
@@ -768,6 +769,165 @@ static int nextSvc(const std::vector<DisplayRow>& rows, int curSvc, int delta) {
     int idx = (int)(it - svcOrder.begin()) + delta;
     idx = std::clamp(idx, 0, (int)svcOrder.size() - 1);
     return svcOrder[idx];
+}
+
+// ---------------------------------------------------------------------------
+// Find dialog (F key) — incremental search over unit name / description
+// ---------------------------------------------------------------------------
+static std::string lowerCopy(std::string s) {
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+static bool serviceMatchesQuery(const Service& s, const std::string& qLower) {
+    if (qLower.empty()) return false;
+    return lowerCopy(s.unit).find(qLower) != std::string::npos ||
+           lowerCopy(s.description).find(qLower) != std::string::npos;
+}
+
+static std::vector<int> findMatchingServices(const std::vector<Service>& svcs, const std::string& query) {
+    std::vector<int> out;
+    const std::string q = lowerCopy(trim(query));
+    if (q.empty()) return out;
+    for (int i = 0; i < (int)svcs.size(); ++i)
+        if (serviceMatchesQuery(svcs[i], q)) out.push_back(i);
+    return out;
+}
+
+static bool runFindDialog(const std::vector<Service>& svcs, int& selSvc) {
+    if (svcs.empty()) return false;
+
+    timeout(-1);
+    curs_set(1);
+
+    std::string query;
+    int pick = 0;
+    bool accepted = false;
+
+    WINDOW* win = nullptr;
+    int dlgW = 0, dlgH = 0, dlgY = 0, dlgX = 0;
+
+    auto destroyWin = [&]() {
+        if (win) { delwin(win); win = nullptr; }
+    };
+
+    auto createWin = [&]() {
+        destroyWin();
+        int scrH = 0, scrW = 0;
+        getmaxyx(stdscr, scrH, scrW);
+        dlgW = std::clamp(std::min(scrW - 4, 72), 32, std::max(32, scrW - 2));
+        dlgH = std::clamp(std::min(scrH - 2, 18), 10, std::max(10, scrH - 2));
+        dlgY = (scrH - dlgH) / 2;
+        dlgX = (scrW - dlgW) / 2;
+        win = newwin(dlgH, dlgW, dlgY, dlgX);
+        keypad(win, TRUE);
+    };
+
+    auto drawDlg = [&](const std::vector<int>& matches) {
+        werase(win);
+        box(win, 0, 0);
+
+        wattron(win, COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+        mvwprintw(win, 1, 2, " Find service ");
+        wattroff(win, COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+
+        mvwprintw(win, 2, 2, "> %-*s", dlgW - 6, query.c_str());
+        wmove(win, 2, 4 + (int)query.size());
+
+        for (int i = 1; i < dlgW - 1; ++i)
+            mvwaddch(win, 3, i, ACS_HLINE | COLOR_PAIR(CP_CHART_GRID) | A_DIM);
+
+        const int listY   = 4;
+        const int listMax = std::max(1, dlgH - 7);
+
+        if (query.empty()) {
+            wattron(win, A_DIM);
+            mvwprintw(win, listY, 2, "Type unit or description...");
+            wattroff(win, A_DIM);
+        } else if (matches.empty()) {
+            wattron(win, COLOR_PAIR(CP_ERR));
+            mvwprintw(win, listY, 2, "No matches");
+            wattroff(win, COLOR_PAIR(CP_ERR));
+        } else {
+            pick = std::clamp(pick, 0, (int)matches.size() - 1);
+            int first = 0;
+            if (pick >= listMax) first = pick - listMax + 1;
+
+            for (int row = 0; row < listMax && first + row < (int)matches.size(); ++row) {
+                const int mi = first + row;
+                const Service& s = svcs[matches[mi]];
+                const bool sel = (mi == pick);
+                const bool active = s.activeState == "active";
+
+                if (sel) wattron(win, A_REVERSE);
+
+                std::string unit = s.unit;
+                if ((int)unit.size() > dlgW - 18) unit = unit.substr(0, (std::size_t)std::max(0, dlgW - 21)) + "...";
+
+                if (!sel) {
+                    if (active) wattron(win, COLOR_PAIR(CP_SVC_ACTIVE));
+                    else        wattron(win, COLOR_PAIR(CP_SVC_DEAD) | A_DIM);
+                }
+                mvwprintw(win, listY + row, 2, " %s %-*s",
+                          g_pinned.count(s.unit) ? "[*]" : "   ",
+                          dlgW - 16, unit.c_str());
+                if (!sel) {
+                    if (active) wattroff(win, COLOR_PAIR(CP_SVC_ACTIVE));
+                    else        wattroff(win, COLOR_PAIR(CP_SVC_DEAD) | A_DIM);
+                }
+
+                if (sel) wattroff(win, A_REVERSE);
+            }
+
+            wattron(win, A_DIM);
+            mvwprintw(win, dlgH - 3, 2, "%zu match(es)", matches.size());
+            wattroff(win, A_DIM);
+        }
+
+        wattron(win, COLOR_PAIR(CP_KEYBINDS) | A_DIM);
+        mvwprintw(win, dlgH - 2, 2, "ENTER:go  ESC:cancel  UP/DOWN:select");
+        wattroff(win, COLOR_PAIR(CP_KEYBINDS) | A_DIM);
+        wrefresh(win);
+    };
+
+    createWin();
+
+    for (bool running = true; running; ) {
+        std::vector<int> matches = findMatchingServices(svcs, query);
+        drawDlg(matches);
+
+        const int ch = wgetch(win);
+        if (ch == KEY_RESIZE) {
+            createWin();
+            continue;
+        }
+        if (ch == 27) {
+            running = false;
+        } else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) {
+            if (!matches.empty()) {
+                selSvc = matches[pick];
+                accepted = true;
+                running = false;
+            }
+        } else if (ch == KEY_UP) {
+            if (!matches.empty()) pick = std::max(0, pick - 1);
+        } else if (ch == KEY_DOWN) {
+            if (!matches.empty()) pick = std::min((int)matches.size() - 1, pick + 1);
+        } else if (ch == 127 || ch == KEY_BACKSPACE || ch == '\b') {
+            if (!query.empty()) {
+                query.pop_back();
+                pick = 0;
+            }
+        } else if (ch >= 32 && ch < 127) {
+            query.push_back((char)ch);
+            pick = 0;
+        }
+    }
+
+    destroyWin();
+    touchwin(stdscr);
+    curs_set(0);
+    return accepted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,6 +1480,10 @@ int main(int argc, char* argv[]) {
             else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) {
                 inDetails = true;
                 startLiveStats(svcs[selSvc].unit);
+            }
+            else if (ch == 'f' || ch == 'F') {
+                if (runFindDialog(svcs, selSvc))
+                    msg = "Find: " + svcs[selSvc].unit;
             }
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
