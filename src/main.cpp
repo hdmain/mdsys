@@ -262,19 +262,14 @@ static std::vector<double> chartSamples(const std::vector<double>& hist, int wid
     if (hist.empty()) return out;
     const int n = (int)hist.size();
     const int w = (int)out.size();
-    if (n == 1 || w <= 1) {
-        const double v = hist.back();
-        out.assign((std::size_t)std::max(1, w), v);
+    if (n >= w) {
+        for (int c = 0; c < w; ++c)
+            out[(std::size_t)c] = hist[(std::size_t)(n - w + c)];
         return out;
     }
-    for (int c = 0; c < w; ++c) {
-        const double t = (double)c / (double)(w - 1);
-        const double pos = t * (double)(n - 1);
-        const int i0 = (int)pos;
-        const int i1 = std::min(i0 + 1, n - 1);
-        const double frac = pos - (double)i0;
-        out[(std::size_t)c] = hist[(std::size_t)i0] * (1.0 - frac) + hist[(std::size_t)i1] * frac;
-    }
+    const int pad = w - n;
+    for (int c = 0; c < w; ++c)
+        out[(std::size_t)c] = (c < pad) ? 0.0 : hist[(std::size_t)(c - pad)];
     return out;
 }
 
@@ -289,25 +284,25 @@ static void drawSeries(int plotY, int plotX, int plotW, int plotH,
                        const std::vector<double>& samples, double maxVal, int colorPair) {
     if (plotW < 1 || plotH < 1) return;
 
+    auto plotPoint = [&](int x, int y) {
+        attron(COLOR_PAIR(colorPair) | A_BOLD);
+        mvaddch(plotY + y, plotX + x, '*');
+        attroff(COLOR_PAIR(colorPair) | A_BOLD);
+    };
+
     int prevX = -1, prevY = -1;
     for (int x = 0; x < plotW; ++x) {
         const int y = valueToRow(samples[(std::size_t)x], maxVal, plotH);
-        for (int row = y; row < plotH; ++row) {
-            const bool peak = (row == y);
-            attron(COLOR_PAIR(colorPair) | (peak ? A_BOLD : A_DIM));
-            mvaddch(plotY + row, plotX + x, peak ? '*' : ':');
-            attroff(COLOR_PAIR(colorPair) | (peak ? A_BOLD : A_DIM));
-        }
-        if (prevX >= 0) {
+        if (prevX < 0) {
+            plotPoint(x, y);
+        } else {
             int x0 = prevX, y0 = prevY, x1 = x, y1 = y;
             const int dx = std::abs(x1 - x0);
             const int sx = x0 < x1 ? 1 : -1;
             int err = dx - std::abs(y1 - y0);
             int cx = x0, cy = y0;
             while (true) {
-                attron(COLOR_PAIR(colorPair) | A_BOLD);
-                mvaddch(plotY + cy, plotX + cx, '*');
-                attroff(COLOR_PAIR(colorPair) | A_BOLD);
+                plotPoint(cx, cy);
                 if (cx == x1 && cy == y1) break;
                 const int e2 = 2 * err;
                 if (e2 > -std::abs(y1 - y0)) { err -= std::abs(y1 - y0); cx += sx; }
@@ -369,9 +364,17 @@ static void drawPanelBorder(int y, int x, int w, int h, int colorPair) {
 }
 
 static void clearRect(int y, int x, int w, int h) {
+    attrset(A_NORMAL);
     for (int r = 0; r < h; ++r)
         for (int c = 0; c < w; ++c)
             mvaddch(y + r, x + c, ' ');
+}
+
+static void wipeRows(int fromRow, int toRow, int width) {
+    attrset(A_NORMAL);
+    for (int y = fromRow; y < toRow; ++y)
+        for (int x = 0; x < width; ++x)
+            mvaddch(y, x, ' ');
 }
 
 static void drawPanelChart(const ChartRect& rc, const std::vector<double>& hist,
@@ -683,7 +686,7 @@ static void drawList(const std::vector<Service>& svcs,
 // ---------------------------------------------------------------------------
 static void drawDetails(const Service& s, int width, int height,
                         const std::string& msg, const std::string& err,
-                        LiveStats& stats) {
+                        const LiveStats& stats) {
     bool pinned = g_pinned.count(s.unit) > 0;
 
     attron(A_BOLD);
@@ -1150,6 +1153,9 @@ int main(int argc, char* argv[]) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
+    leaveok(stdscr, TRUE);
+    scrollok(stdscr, FALSE);
+    idlok(stdscr, FALSE);
     nodelay(stdscr, TRUE);   // non-blocking getch during loading
 
     if (has_colors()) initColors();
@@ -1189,6 +1195,32 @@ int main(int argc, char* argv[]) {
     int  selSvc     = svcs.empty() ? 0 : rows[0].kind == RowKind::Service ? rows[0].svcIdx : nextSvc(rows, 0, 0);
     bool inDetails  = false;
     LiveStats liveStats;
+    std::mutex liveStatsMtx;
+    std::thread liveStatsThread;
+    std::atomic<bool> liveStatsRun{false};
+
+    auto stopLiveStats = [&]() {
+        liveStatsRun.store(false);
+        if (liveStatsThread.joinable()) liveStatsThread.join();
+    };
+
+    auto startLiveStats = [&](const std::string& unit) {
+        stopLiveStats();
+        {
+            std::lock_guard<std::mutex> lk(liveStatsMtx);
+            liveStats = LiveStats{};
+        }
+        liveStatsRun.store(true);
+        liveStatsThread = std::thread([&, unit]() {
+            while (liveStatsRun.load()) {
+                {
+                    std::lock_guard<std::mutex> lk(liveStatsMtx);
+                    tickLiveStats(unit, liveStats);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        });
+    };
 
     auto reload = [&](const std::string& newMsg = "") {
         // Show loading animation while reloading.
@@ -1215,23 +1247,24 @@ int main(int argc, char* argv[]) {
     while (true) {
         int W = 0, H = 0;
         getmaxyx(stdscr, H, W);
-        clear();
 
         drawTitleBar(W);
+        wipeRows(1, H - 1, W);
 
         if (svcs.empty()) {
             mvhline(2, 0, ACS_HLINE, W);
             mvprintw(4, 2, "No services found.");
             if (!err.empty()) { attron(COLOR_PAIR(CP_ERR)); mvprintw(5, 2, "%s", err.c_str()); attroff(COLOR_PAIR(CP_ERR)); }
             mvprintw(7, 2, "TAB: toggle system/user    U: refresh    Q: quit");
-        } else {
-            if (inDetails)
-                tickLiveStats(svcs[selSvc].unit, liveStats);
-            if (inDetails) {
-                drawDetails(svcs[selSvc], W, H - 1, msg, err, liveStats);
-            } else {
-                drawList(svcs, rows, selSvc, W, H - 1, msg, err);
+        } else if (inDetails) {
+            LiveStats statsSnap;
+            {
+                std::lock_guard<std::mutex> lk(liveStatsMtx);
+                statsSnap = liveStats;
             }
+            drawDetails(svcs[selSvc], W, H - 1, msg, err, statsSnap);
+        } else {
+            drawList(svcs, rows, selSvc, W, H - 1, msg, err);
         }
 
         drawKeybindBar(H - 1, W, inDetails);
@@ -1249,7 +1282,7 @@ int main(int argc, char* argv[]) {
         if (ch == 'q' || ch == 'Q') {
             if (inDetails) {
                 inDetails = false;
-                liveStats = LiveStats{};
+                stopLiveStats();
                 continue;
             }
             break;
@@ -1259,7 +1292,7 @@ int main(int argc, char* argv[]) {
         if (ch == '\t') {
             g_systemMode = !g_systemMode;
             inDetails = false;
-            liveStats = LiveStats{};
+            stopLiveStats();
             selSvc = 0;
             reload(std::string(g_systemMode ? "System" : "User") + " mode — " +
                    std::to_string(svcs.size()) + " service(s).");
@@ -1286,8 +1319,7 @@ int main(int argc, char* argv[]) {
                 selSvc = nextSvc(rows, selSvc,  10);
             else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) {
                 inDetails = true;
-                liveStats = LiveStats{};
-                tickLiveStats(svcs[selSvc].unit, liveStats);
+                startLiveStats(svcs[selSvc].unit);
             }
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
@@ -1313,7 +1345,7 @@ int main(int argc, char* argv[]) {
         } else {
             if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13 || ch == 27) {
                 inDetails = false;
-                liveStats = LiveStats{};
+                stopLiveStats();
             }
             else if (ch == 'p' || ch == 'P') {
                 const std::string& u = svcs[selSvc].unit;
@@ -1339,6 +1371,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    stopLiveStats();
     endwin();
     return 0;
 }
