@@ -124,3 +124,21 @@ Description: TUI systemd service manager for Linux/WSL
  ;Features: service list with RAM usage, pin/unpin, restart/start/stop,
  ;live log viewer via journalctl, system/user mode toggle.
 
+Package: mdsys
+Version: 0.2.7
+Architecture: amd64
+Maintainer: hdmain <noreply@github.com>
+Installed-Size: 192
+Depends: libncurses6 (>= 6), systemd, less
+Filename: pool/main/mdsys_0.2.7_amd64.deb
+Size: 74588
+MD5sum: 98f35b2c5a97c930041801109d074c66
+SHA1: fa512b8b5e049b3d42cd5ca44f90f23abd1fe10a
+SHA256: eb11051a000c4a6d73635f8bebf56bec03ac31b6e67d434770da489c858cbc5e
+Section: admin
+Priority: optional
+Description: TUI systemd service manager for Linux/WSL
+ mdsys is a terminal UI manager for systemd user and system services.
+ ;Features: service list with RAM usage, pin/unpin, restart/start/stop,
+ ;live log viewer via journalctl, system/user mode toggle.
+
