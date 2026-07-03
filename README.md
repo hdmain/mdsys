@@ -84,10 +84,13 @@ This creates `/etc/systemd/system/httpprot.service` (or `~/.config/systemd/user/
 
 ## Keybindings
 
+### List view
+
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` or `W` / `J` | Navigate |
+| `↑` / `↓` or `w` / `j` | Navigate |
 | `Enter` | Open service details |
+| `F` | Find service (incremental search) |
 | `R` | Restart selected service |
 | `S` | Start selected service |
 | `K` | Stop selected service |
@@ -96,15 +99,41 @@ This creates `/etc/systemd/system/httpprot.service` (or `~/.config/systemd/user/
 | `Tab` | Toggle system ↔ user mode |
 | `U` | Refresh list |
 | `Q` | Quit |
+| `?` | Help |
+
+### Details view
+
+| Key | Action |
+|-----|--------|
+| `Enter` / `Q` / `Esc` | Back to list |
+| `R` / `S` / `K` | Restart / start / stop |
+| `P` | Pin / unpin |
+| `C` | Console log |
+| `Tab` | Toggle system ↔ user mode |
+| `U` | Refresh list |
+| `?` | Help |
+
+Charts refresh live every 0.2 s (CPU and RAM).
+
+### Find dialog (`F`)
+
+| Key | Action |
+|-----|--------|
+| Type text | Filter by unit name or description (live) |
+| `↑` / `↓` | Select match |
+| `Enter` | Jump to selected service |
+| `Esc` | Cancel |
+| `Backspace` | Delete character |
 
 ## Features
 
 - Lists system or user services (`systemctl` / `systemctl --user`)
 - Shows active state, sub-state, and live RAM (`MemoryCurrent`)
 - **Pinned** category — pin important services to the top; pins are saved across sessions
-- **Details** view — description, PID, memory, start timestamp
+- **Find** — incremental search (`F`) by unit name or description
+- **Details** view — executable path, PID, status, live CPU/RAM charts
 - **Console** — opens `journalctl` output for the selected service in `less`
-- Register any binary as a systemd service with one command
+- Register any binary or command as a systemd service with one command
 - Animated loading screen
 - Color-coded TUI (green = active, dimmed = inactive, yellow = pinned)
 - Auto-detects real user when run as root

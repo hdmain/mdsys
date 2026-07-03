@@ -13,7 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -191,7 +193,7 @@ static void loadPinned() {
 // Service data
 // ---------------------------------------------------------------------------
 struct Service {
-    std::string        unit, loadState, activeState, subState, description, mainPid, startedAt;
+    std::string        unit, loadState, activeState, subState, description, execPath, mainPid, startedAt;
     unsigned long long memBytes = 0;
 };
 
@@ -222,6 +224,42 @@ static std::string fmtMem(unsigned long long b) {
     if (i == 0) o << (unsigned long long)v << " " << U[i];
     else        o << std::fixed << std::setprecision(1) << v << " " << U[i];
     return o.str();
+}
+
+static std::string parseSystemdExecPath(const std::string& v) {
+    const std::string key = "path=";
+    auto pos = v.find(key);
+    if (pos == std::string::npos) return "";
+    pos += key.size();
+    if (pos < v.size() && v[pos] == '"') {
+        ++pos;
+        auto end = v.find('"', pos);
+        return end != std::string::npos ? v.substr(pos, end - pos) : std::string();
+    }
+    auto end = v.find_first_of(" ;}", pos);
+    if (end == std::string::npos) end = v.size();
+    return trim(v.substr(pos, end - pos));
+}
+
+static std::string readProcExe(const std::string& pidStr) {
+    unsigned long pid = strtoul(pidStr.c_str(), nullptr, 10);
+    if (pid == 0) return "";
+    char buf[PATH_MAX + 1];
+    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    const ssize_t n = readlink(link.c_str(), buf, PATH_MAX);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+    return buf;
+}
+
+static std::string resolveExecPath(const std::string& mainPid,
+                                   const std::string& execMainStart,
+                                   const std::string& execStart) {
+    std::string path = readProcExe(mainPid);
+    if (!path.empty()) return path;
+    path = parseSystemdExecPath(execMainStart);
+    if (!path.empty()) return path;
+    return parseSystemdExecPath(execStart);
 }
 
 static std::string pfx()  { return g_systemMode ? "" : g_user.userSessionPrefix; }
@@ -487,6 +525,93 @@ static void tickLiveStats(const std::string& unit, LiveStats& st) {
     st.scaleCpuMax = std::clamp(st.scaleCpuMax, 5.0, 100.0);
 }
 
+static const char* kShowProperties =
+    "--property=Id --property=MemoryCurrent --property=MainPID"
+    " --property=ExecMainStartTimestamp --property=Description"
+    " --property=ExecMainStart --property=ExecStart";
+
+static std::string showLineValue(const std::string& line, const char* key) {
+    const std::size_t kl = strlen(key);
+    return (line.size() > kl && line.substr(0, kl) == key) ? trim(line.substr(kl)) : std::string();
+}
+
+static void applyShowBlock(const std::string& block, Service& s) {
+    std::string execMainStart, execStart;
+    std::istringstream ps(block);
+    std::string pl;
+    while (std::getline(ps, pl)) {
+        std::string v;
+        if (!(v = showLineValue(pl, "Id=")).empty()) { /* matched via map */ }
+        else if (!(v = showLineValue(pl, "MemoryCurrent=")).empty() && v != "[not set]")
+            s.memBytes = strtoull(v.c_str(), nullptr, 10);
+        else if (!(v = showLineValue(pl, "MainPID=")).empty())
+            s.mainPid = v;
+        else if (!(v = showLineValue(pl, "ExecMainStartTimestamp=")).empty())
+            s.startedAt = v;
+        else if (!(v = showLineValue(pl, "ExecMainStart=")).empty())
+            execMainStart = v;
+        else if (!(v = showLineValue(pl, "ExecStart=")).empty() && execStart.empty())
+            execStart = v;
+        else if (!(v = showLineValue(pl, "Description=")).empty() && s.description.empty())
+            s.description = v;
+    }
+    s.execPath = resolveExecPath(s.mainPid, execMainStart, execStart);
+}
+
+static void forEachShowBlock(const std::string& out, const std::function<void(const std::string&)>& fn) {
+    std::string block;
+    std::istringstream ss(out);
+    std::string line;
+    auto flush = [&]() {
+        const std::string trimmed = trim(block);
+        if (!trimmed.empty()) fn(trimmed);
+        block.clear();
+    };
+    while (std::getline(ss, line)) {
+        if (line.empty()) flush();
+        else {
+            if (!block.empty()) block += '\n';
+            block += line;
+        }
+    }
+    flush();
+}
+
+static void enrichServicesFromShow(std::vector<Service>& svcs) {
+    if (svcs.empty()) return;
+
+    constexpr std::size_t kBatchSize = 128;
+    std::map<std::string, std::size_t> idxByUnit;
+    for (std::size_t i = 0; i < svcs.size(); ++i)
+        idxByUnit[svcs[i].unit] = i;
+
+    for (std::size_t batch = 0; batch < svcs.size(); batch += kBatchSize) {
+        const std::size_t end = std::min(batch + kBatchSize, svcs.size());
+        std::string cmd = pfx() + "systemctl " + flag() + "show ";
+        for (std::size_t i = batch; i < end; ++i)
+            cmd += shellQ(svcs[i].unit) + " ";
+        cmd += kShowProperties;
+        cmd += " 2>&1";
+
+        int ec = 0;
+        const std::string out = runCmd(cmd, &ec);
+        if (ec) continue;
+
+        forEachShowBlock(out, [&](const std::string& block) {
+            std::string unitId;
+            std::istringstream bs(block);
+            std::string bl;
+            while (std::getline(bs, bl)) {
+                if (!(unitId = showLineValue(bl, "Id=")).empty()) break;
+            }
+            if (unitId.empty()) return;
+            auto it = idxByUnit.find(unitId);
+            if (it != idxByUnit.end())
+                applyShowBlock(block, svcs[it->second]);
+        });
+    }
+}
+
 static std::vector<Service> loadServices(std::string& err) {
     err.clear();
     std::vector<Service> svcs;
@@ -510,27 +635,10 @@ static std::vector<Service> loadServices(std::string& err) {
         Service s;
         s.unit = cols[uc]; s.loadState = cols[uc+1]; s.activeState = cols[uc+2]; s.subState = cols[uc+3];
         for (std::size_t i = uc+4; i < cols.size(); ++i) { if (i > (std::size_t)(uc+4)) s.description += ' '; s.description += cols[i]; }
-
-        int sec = 0;
-        std::string sout = runCmd(pfx() + "systemctl " + flag() + "show " + shellQ(s.unit) +
-            " --property=MemoryCurrent --property=MainPID"
-            " --property=ExecMainStartTimestamp --property=Description", &sec);
-        if (!sec) {
-            std::istringstream ps(sout); std::string pl;
-            while (std::getline(ps, pl)) {
-                auto val = [&](const char* k) {
-                    std::size_t kl = strlen(k);
-                    return (pl.size() > kl && pl.substr(0, kl) == k) ? trim(pl.substr(kl)) : std::string();
-                };
-                std::string v;
-                if (!(v = val("MemoryCurrent=")).empty() && v != "[not set]") s.memBytes = strtoull(v.c_str(), nullptr, 10);
-                else if (!(v = val("MainPID=")).empty())                      s.mainPid = v;
-                else if (!(v = val("ExecMainStartTimestamp=")).empty())        s.startedAt = v;
-                else if (!(v = val("Description=")).empty() && s.description.empty()) s.description = v;
-            }
-        }
         svcs.push_back(s);
     }
+
+    enrichServicesFromShow(svcs);
 
     // Sort: pinned first, then active, then inactive; alphabetical within each group.
     std::sort(svcs.begin(), svcs.end(), [](const Service& a, const Service& b) {
@@ -581,8 +689,8 @@ static void drawTitleBar(int width) {
 static void drawKeybindBar(int row, int width, bool inDetails) {
     attron(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
     std::string kb = inDetails
-        ? "  ENTER/Q:back  R:restart  S:start  K:stop  P:pin/unpin  C:console  TAB:mode  U:refresh"
-        : "  UP/DOWN:select  ENTER:details  F:find  R:restart  S:start  K:stop  P:pin  C:console  TAB:mode  U:refresh  Q:quit";
+        ? "  ENTER/Q:back  R:restart  S:start  K:stop  P:pin  C:console  TAB:mode  U:refresh  ?:help"
+        : "  UP/DOWN:select  ENTER:details  F:find  R/S/K  P:pin  C:console  TAB:mode  U:refresh  Q:quit  ?:help";
     mvprintw(row, 0, "%-*s", width, kb.c_str());
     attroff(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
 }
@@ -706,9 +814,12 @@ static void drawDetails(const Service& s, int width, int height,
     attroff(COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
     mvprintw(3, 8, "%s", unit.c_str());
 
-    std::string desc = s.description;
-    if ((int)desc.size() > width - 6) desc = desc.substr(0, (std::size_t)std::max(0, width - 9)) + "...";
-    mvprintw(4, 2, "%s", desc.c_str());
+    std::string bin = s.execPath.empty() ? "-" : s.execPath;
+    if ((int)bin.size() > width - 14) bin = bin.substr(0, (std::size_t)std::max(0, width - 17)) + "...";
+    attron(COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+    mvprintw(4, 2, "Exec:");
+    attroff(COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+    mvprintw(4, 8, "%s", bin.c_str());
 
     const char* pid = (s.mainPid.empty() || s.mainPid == "0") ? "-" : s.mainPid.c_str();
     mvprintw(5, 2, "%s / %s   PID %s   load %s",
@@ -928,6 +1039,126 @@ static bool runFindDialog(const std::vector<Service>& svcs, int& selSvc) {
     touchwin(stdscr);
     curs_set(0);
     return accepted;
+}
+
+// ---------------------------------------------------------------------------
+// Help dialog (? key)
+// ---------------------------------------------------------------------------
+static void runHelpDialog(bool /*inDetails*/) {
+    timeout(-1);
+    curs_set(0);
+
+    std::vector<std::string> lines;
+    lines.push_back("mdsys " MDSYS_VERSION " — keyboard shortcuts");
+    lines.push_back("");
+    lines.push_back("List view");
+    lines.push_back("  UP/DOWN, w/j     navigate");
+    lines.push_back("  PgUp/PgDn        page up / down");
+    lines.push_back("  Enter            open service details");
+    lines.push_back("  F                find service");
+    lines.push_back("  R  S  K          restart / start / stop");
+    lines.push_back("  P                pin / unpin service");
+    lines.push_back("  C                console log (journalctl)");
+    lines.push_back("  Tab              toggle system / user mode");
+    lines.push_back("  U                refresh service list");
+    lines.push_back("  Q                quit");
+    lines.push_back("");
+    lines.push_back("Details view");
+    lines.push_back("  Enter / Q / Esc  back to list");
+    lines.push_back("  R  S  K          restart / start / stop");
+    lines.push_back("  P                pin / unpin");
+    lines.push_back("  C                console log");
+    lines.push_back("  Tab / U          mode toggle / refresh");
+    lines.push_back("  Charts           live CPU & RAM (0.2s)");
+    lines.push_back("");
+    lines.push_back("Find dialog (F)");
+    lines.push_back("  type text        filter by name / description");
+    lines.push_back("  UP/DOWN          select match");
+    lines.push_back("  Enter            jump to service");
+    lines.push_back("  Esc              cancel");
+
+    WINDOW* win = nullptr;
+    int dlgW = 0, dlgH = 0, scroll = 0;
+
+    auto destroyWin = [&]() {
+        if (win) { delwin(win); win = nullptr; }
+    };
+
+    auto createWin = [&]() {
+        destroyWin();
+        int scrH = 0, scrW = 0;
+        getmaxyx(stdscr, scrH, scrW);
+        dlgW = std::clamp(std::min(scrW - 4, 64), 36, std::max(36, scrW - 2));
+        dlgH = std::clamp(std::min(scrH - 2, 24), 12, std::max(12, scrH - 2));
+        const int dlgY = (scrH - dlgH) / 2;
+        const int dlgX = (scrW - dlgW) / 2;
+        win = newwin(dlgH, dlgW, dlgY, dlgX);
+        keypad(win, TRUE);
+        scroll = std::clamp(scroll, 0, std::max(0, (int)lines.size() - (dlgH - 4)));
+    };
+
+    auto drawDlg = [&]() {
+        werase(win);
+        box(win, 0, 0);
+
+        wattron(win, COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+        mvwprintw(win, 1, 2, " Help ");
+        wattroff(win, COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+
+        const int viewH = dlgH - 4;
+        scroll = std::clamp(scroll, 0, std::max(0, (int)lines.size() - viewH));
+
+        for (int row = 0; row < viewH; ++row) {
+            const int idx = scroll + row;
+            if (idx >= (int)lines.size()) break;
+            const std::string& line = lines[(std::size_t)idx];
+            if (line.empty()) continue;
+            const bool header = line.find("  ") != 0 && line.find("mdsys") != 0;
+            if (header)
+                wattron(win, COLOR_PAIR(CP_CATEGORY) | A_BOLD);
+            else
+                wattron(win, A_NORMAL);
+            mvwprintw(win, 2 + row, 2, "%-*s", dlgW - 4,
+                      line.size() > (std::size_t)dlgW - 4
+                          ? (line.substr(0, (std::size_t)std::max(0, dlgW - 7)) + "...").c_str()
+                          : line.c_str());
+            if (header)
+                wattroff(win, COLOR_PAIR(CP_CATEGORY) | A_BOLD);
+            else
+                wattroff(win, A_NORMAL);
+        }
+
+        wattron(win, COLOR_PAIR(CP_KEYBINDS) | A_DIM);
+        mvwprintw(win, dlgH - 2, 2, "UP/DOWN:scroll  Esc/?/Q:close");
+        wattroff(win, COLOR_PAIR(CP_KEYBINDS) | A_DIM);
+        wrefresh(win);
+    };
+
+    createWin();
+
+    for (bool running = true; running; ) {
+        drawDlg();
+        const int ch = wgetch(win);
+        if (ch == KEY_RESIZE) {
+            createWin();
+            continue;
+        }
+        const int viewH = dlgH - 4;
+        if (ch == 27 || ch == '?' || ch == 'q' || ch == 'Q')
+            running = false;
+        else if (ch == KEY_UP)
+            scroll = std::max(0, scroll - 1);
+        else if (ch == KEY_DOWN)
+            scroll = std::min(std::max(0, (int)lines.size() - viewH), scroll + 1);
+        else if (ch == KEY_PPAGE)
+            scroll = std::max(0, scroll - viewH);
+        else if (ch == KEY_NPAGE)
+            scroll = std::min(std::max(0, (int)lines.size() - viewH), scroll + viewH);
+    }
+
+    destroyWin();
+    touchwin(stdscr);
+    curs_set(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,7 +1646,7 @@ int main(int argc, char* argv[]) {
             mvhline(2, 0, ACS_HLINE, W);
             mvprintw(4, 2, "No services found.");
             if (!err.empty()) { attron(COLOR_PAIR(CP_ERR)); mvprintw(5, 2, "%s", err.c_str()); attroff(COLOR_PAIR(CP_ERR)); }
-            mvprintw(7, 2, "TAB: toggle system/user    U: refresh    Q: quit");
+            mvprintw(7, 2, "TAB: toggle system/user    U: refresh    ?: help    Q: quit");
         } else if (inDetails) {
             LiveStats statsSnap;
             {
@@ -1463,6 +1694,11 @@ int main(int argc, char* argv[]) {
         // Refresh
         if (ch == 'u' || ch == 'U') {
             reload("Refreshed — " + std::to_string(svcs.size()) + " service(s).");
+            continue;
+        }
+
+        if (ch == '?') {
+            runHelpDialog(inDetails);
             continue;
         }
 

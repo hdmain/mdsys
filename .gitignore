@@ -1,1 +1,47 @@
-/build-wsl
+# CMake / build directories
+/build/
+/build-wsl/
+/cmake-build-*/
+/out/
+
+# Compiled binaries & objects
+/mdsys
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+a.out
+
+# CMake generated files (outside build/)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# CPack / packaging artifacts
+*.deb
+*.rpm
+*.tar.gz
+*.tar.zst
+*.pkg.tar.*
+/pkg/
+
+# makepkg (Arch) — do not ignore /src/ (project source lives there)
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
