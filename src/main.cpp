@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cerrno>
 #include <climits>
+#include <cstdint>
 
 #include <algorithm>
 #include <atomic>
@@ -525,10 +526,13 @@ static void tickLiveStats(const std::string& unit, LiveStats& st) {
     st.scaleCpuMax = std::clamp(st.scaleCpuMax, 5.0, 100.0);
 }
 
-static const char* kShowProperties =
+// List enrich: skip Exec* — resolve binary path lazily in details only.
+static const char* kShowPropertiesList =
     "--property=Id --property=MemoryCurrent --property=MainPID"
-    " --property=ExecMainStartTimestamp --property=Description"
-    " --property=ExecMainStart --property=ExecStart";
+    " --property=ExecMainStartTimestamp --property=Description";
+
+static const char* kShowPropertiesExec =
+    "--property=MainPID --property=ExecMainStart --property=ExecStart";
 
 static std::string showLineValue(const std::string& line, const char* key) {
     const std::size_t kl = strlen(key);
@@ -536,7 +540,6 @@ static std::string showLineValue(const std::string& line, const char* key) {
 }
 
 static void applyShowBlock(const std::string& block, Service& s) {
-    std::string execMainStart, execStart;
     std::istringstream ps(block);
     std::string pl;
     while (std::getline(ps, pl)) {
@@ -548,14 +551,9 @@ static void applyShowBlock(const std::string& block, Service& s) {
             s.mainPid = v;
         else if (!(v = showLineValue(pl, "ExecMainStartTimestamp=")).empty())
             s.startedAt = v;
-        else if (!(v = showLineValue(pl, "ExecMainStart=")).empty())
-            execMainStart = v;
-        else if (!(v = showLineValue(pl, "ExecStart=")).empty() && execStart.empty())
-            execStart = v;
         else if (!(v = showLineValue(pl, "Description=")).empty() && s.description.empty())
             s.description = v;
     }
-    s.execPath = resolveExecPath(s.mainPid, execMainStart, execStart);
 }
 
 static void forEachShowBlock(const std::string& out, const std::function<void(const std::string&)>& fn) {
@@ -577,20 +575,28 @@ static void forEachShowBlock(const std::string& out, const std::function<void(co
     flush();
 }
 
-static void enrichServicesFromShow(std::vector<Service>& svcs) {
-    if (svcs.empty()) return;
+static void sortServices(std::vector<Service>& svcs) {
+    std::sort(svcs.begin(), svcs.end(), [](const Service& a, const Service& b) {
+        int pa = g_pinned.count(a.unit) ? 0 : (a.activeState == "active" ? 1 : 2);
+        int pb = g_pinned.count(b.unit) ? 0 : (b.activeState == "active" ? 1 : 2);
+        return pa != pb ? pa < pb : a.unit < b.unit;
+    });
+}
 
-    constexpr std::size_t kBatchSize = 128;
+static void enrichServiceIndices(std::vector<Service>& svcs, const std::vector<std::size_t>& indices) {
+    if (indices.empty()) return;
+
+    constexpr std::size_t kBatchSize = 64;
     std::map<std::string, std::size_t> idxByUnit;
-    for (std::size_t i = 0; i < svcs.size(); ++i)
+    for (std::size_t i : indices)
         idxByUnit[svcs[i].unit] = i;
 
-    for (std::size_t batch = 0; batch < svcs.size(); batch += kBatchSize) {
-        const std::size_t end = std::min(batch + kBatchSize, svcs.size());
+    for (std::size_t batch = 0; batch < indices.size(); batch += kBatchSize) {
+        const std::size_t end = std::min(batch + kBatchSize, indices.size());
         std::string cmd = pfx() + "systemctl " + flag() + "show ";
-        for (std::size_t i = batch; i < end; ++i)
-            cmd += shellQ(svcs[i].unit) + " ";
-        cmd += kShowProperties;
+        for (std::size_t b = batch; b < end; ++b)
+            cmd += shellQ(svcs[indices[b]].unit) + " ";
+        cmd += kShowPropertiesList;
         cmd += " 2>&1";
 
         int ec = 0;
@@ -612,13 +618,42 @@ static void enrichServicesFromShow(std::vector<Service>& svcs) {
     }
 }
 
-static std::vector<Service> loadServices(std::string& err) {
+static void ensureExecPath(Service& s) {
+    if (!s.execPath.empty()) return;
+    s.execPath = readProcExe(s.mainPid);
+    if (!s.execPath.empty()) return;
+
+    int ec = 0;
+    std::string out = runCmd(pfx() + "systemctl " + flag() + "show " + shellQ(s.unit) +
+        " " + kShowPropertiesExec + " 2>&1", &ec);
+    if (ec) return;
+
+    std::string execMainStart, execStart, mainPid = s.mainPid;
+    std::istringstream ps(out);
+    std::string pl;
+    while (std::getline(ps, pl)) {
+        std::string v;
+        if (!(v = showLineValue(pl, "MainPID=")).empty())
+            mainPid = v;
+        else if (!(v = showLineValue(pl, "ExecMainStart=")).empty())
+            execMainStart = v;
+        else if (!(v = showLineValue(pl, "ExecStart=")).empty() && execStart.empty())
+            execStart = v;
+    }
+    if (s.mainPid.empty()) s.mainPid = mainPid;
+    s.execPath = resolveExecPath(mainPid, execMainStart, execStart);
+}
+
+static std::vector<Service> parseListUnits(std::string& err) {
     err.clear();
     std::vector<Service> svcs;
     int ec = 0;
     std::string out = runCmd(pfx() + "systemctl " + flag() +
         "list-units --type=service --all --no-legend --no-pager 2>&1", &ec);
-    if (ec) { err = (g_systemMode ? "system" : "user") + std::string(" mode failed: ") + trim(out); return svcs; }
+    if (ec) {
+        err = (g_systemMode ? "system" : "user") + std::string(" mode failed: ") + trim(out);
+        return svcs;
+    }
 
     std::istringstream ss(out); std::string line;
     while (std::getline(ss, line)) {
@@ -634,19 +669,66 @@ static std::vector<Service> loadServices(std::string& err) {
 
         Service s;
         s.unit = cols[uc]; s.loadState = cols[uc+1]; s.activeState = cols[uc+2]; s.subState = cols[uc+3];
-        for (std::size_t i = uc+4; i < cols.size(); ++i) { if (i > (std::size_t)(uc+4)) s.description += ' '; s.description += cols[i]; }
+        for (std::size_t i = uc+4; i < cols.size(); ++i) {
+            if (i > (std::size_t)(uc+4)) s.description += ' ';
+            s.description += cols[i];
+        }
         svcs.push_back(s);
     }
-
-    enrichServicesFromShow(svcs);
-
-    // Sort: pinned first, then active, then inactive; alphabetical within each group.
-    std::sort(svcs.begin(), svcs.end(), [](const Service& a, const Service& b) {
-        int pa = g_pinned.count(a.unit) ? 0 : (a.activeState == "active" ? 1 : 2);
-        int pb = g_pinned.count(b.unit) ? 0 : (b.activeState == "active" ? 1 : 2);
-        return pa != pb ? pa < pb : a.unit < b.unit;
-    });
+    sortServices(svcs);
     return svcs;
+}
+
+// Progressive catalog: list appears ASAP, then pinned enrich, then the rest.
+struct ServiceCatalog {
+    std::mutex              mtx;
+    std::vector<Service>    svcs;
+    std::string             err;
+    std::atomic<bool>       listReady{false};
+    std::atomic<bool>       enrichDone{false};
+    std::atomic<uint64_t>   generation{0};
+
+    void publish(std::vector<Service> next, const std::string& nextErr) {
+        std::lock_guard<std::mutex> lk(mtx);
+        svcs = std::move(next);
+        err  = nextErr;
+        generation.fetch_add(1, std::memory_order_release);
+    }
+
+    void snapshot(std::vector<Service>& out, std::string& outErr) {
+        std::lock_guard<std::mutex> lk(mtx);
+        out    = svcs;
+        outErr = err;
+    }
+};
+
+static void loadServicesProgressive(ServiceCatalog& cat, std::atomic<bool>& cancel) {
+    std::string err;
+    std::vector<Service> svcs = parseListUnits(err);
+    if (cancel.load(std::memory_order_acquire)) return;
+    cat.publish(svcs, err);
+    cat.listReady.store(true, std::memory_order_release);
+    if (err.empty() && !svcs.empty() && !cancel.load(std::memory_order_acquire)) {
+        std::vector<std::size_t> pinned, rest;
+        for (std::size_t i = 0; i < svcs.size(); ++i) {
+            if (g_pinned.count(svcs[i].unit)) pinned.push_back(i);
+            else rest.push_back(i);
+        }
+        enrichServiceIndices(svcs, pinned);
+        if (cancel.load(std::memory_order_acquire)) return;
+        cat.publish(svcs, err);
+
+        constexpr std::size_t kChunk = 64;
+        for (std::size_t off = 0; off < rest.size(); off += kChunk) {
+            if (cancel.load(std::memory_order_acquire)) return;
+            std::vector<std::size_t> chunk(
+                rest.begin() + (std::ptrdiff_t)off,
+                rest.begin() + (std::ptrdiff_t)std::min(off + kChunk, rest.size()));
+            enrichServiceIndices(svcs, chunk);
+            cat.publish(svcs, err);
+        }
+    }
+    cat.enrichDone.store(true, std::memory_order_release);
 }
 
 static int doAction(const std::string& unit, const std::string& action) {
@@ -793,7 +875,7 @@ static void drawList(const std::vector<Service>& svcs,
 // ---------------------------------------------------------------------------
 // Details view
 // ---------------------------------------------------------------------------
-static void drawDetails(const Service& s, int width, int height,
+static void drawDetails(Service& s, int width, int height,
                         const std::string& msg, const std::string& err,
                         const LiveStats& stats) {
     bool pinned = g_pinned.count(s.unit) > 0;
@@ -814,6 +896,7 @@ static void drawDetails(const Service& s, int width, int height,
     attroff(COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
     mvprintw(3, 8, "%s", unit.c_str());
 
+    ensureExecPath(s);
     std::string bin = s.execPath.empty() ? "-" : s.execPath;
     if ((int)bin.size() > width - 14) bin = bin.substr(0, (std::size_t)std::max(0, width - 17)) + "...";
     attron(COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
@@ -1551,37 +1634,45 @@ int main(int argc, char* argv[]) {
 
     if (has_colors()) initColors();
 
-    // Kick off service loading in a background thread.
-    std::string err;
-    std::vector<Service> svcs;
-    std::atomic<bool> loadDone{false};
+    // Progressive load: show list ASAP, enrich pinned first, rest in background.
+    ServiceCatalog catalog;
+    std::atomic<bool> loadCancel{false};
+    std::thread loader([&]() { loadServicesProgressive(catalog, loadCancel); });
 
-    std::thread loader([&]() {
-        svcs = loadServices(err);
-        loadDone.store(true, std::memory_order_release);
-    });
-
-    // Animate until loading finishes (or user presses Q to abort).
     int frame = 0;
     bool aborted = false;
-    while (!loadDone.load(std::memory_order_acquire)) {
+    while (!catalog.listReady.load(std::memory_order_acquire)) {
         int W = 0, H = 0;
         getmaxyx(stdscr, H, W);
         clear();
         drawLoadingScreen(frame++, W, H);
         refresh();
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
         int ch = getch();
-        if (ch == 'q' || ch == 'Q') { aborted = true; break; }
+        if (ch == 'q' || ch == 'Q') {
+            aborted = true;
+            loadCancel.store(true, std::memory_order_release);
+            break;
+        }
     }
-    loader.join();
 
-    if (aborted) { endwin(); return 0; }
+    if (aborted) {
+        loader.join();
+        endwin();
+        return 0;
+    }
 
-    nodelay(stdscr, FALSE);  // back to blocking input
+    nodelay(stdscr, FALSE);
+
+    std::string err;
+    std::vector<Service> svcs;
+    catalog.snapshot(svcs, err);
+    uint64_t seenGen = catalog.generation.load(std::memory_order_acquire);
 
     std::vector<DisplayRow> rows = buildRows(svcs);
     std::string msg = "Loaded " + std::to_string(svcs.size()) + " service(s).";
+    if (!catalog.enrichDone.load(std::memory_order_acquire))
+        msg += "  (loading details...)";
 
     int  selSvc     = svcs.empty() ? 0 : rows[0].kind == RowKind::Service ? rows[0].svcIdx : nextSvc(rows, 0, 0);
     bool inDetails  = false;
@@ -1613,29 +1704,97 @@ int main(int argc, char* argv[]) {
         });
     };
 
-    auto reload = [&](const std::string& newMsg = "") {
-        // Show loading animation while reloading.
-        std::atomic<bool> done{false};
-        std::vector<Service> tmp;
-        std::string tmpErr;
-        std::thread t([&]() { tmp = loadServices(tmpErr); done.store(true, std::memory_order_release); });
-        nodelay(stdscr, TRUE);
-        int f = 0;
-        while (!done.load(std::memory_order_acquire)) {
-            int W = 0, H = 0; getmaxyx(stdscr, H, W);
-            clear(); drawLoadingScreen(f++, W, H); refresh();
-            std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        }
-        t.join();
-        nodelay(stdscr, FALSE);
-        svcs = std::move(tmp);
-        err  = std::move(tmpErr);
+    auto applyCatalogSnapshot = [&](bool updateStatusMsg = true) {
+        const std::string keepUnit = (!svcs.empty() && selSvc >= 0 && selSvc < (int)svcs.size())
+            ? svcs[selSvc].unit : std::string();
+        catalog.snapshot(svcs, err);
+        seenGen = catalog.generation.load(std::memory_order_acquire);
+        sortServices(svcs);
         rows = buildRows(svcs);
-        if (!newMsg.empty()) msg = newMsg;
+
+        if (updateStatusMsg) {
+            msg = "Loaded " + std::to_string(svcs.size()) + " service(s).";
+            if (!catalog.enrichDone.load(std::memory_order_acquire))
+                msg += "  (loading details...)";
+        }
+
+        if (!keepUnit.empty()) {
+            selSvc = 0;
+            for (int i = 0; i < (int)svcs.size(); ++i) {
+                if (svcs[i].unit == keepUnit) { selSvc = i; break; }
+            }
+        } else if (!svcs.empty()) {
+            selSvc = nextSvc(rows, 0, 0);
+        }
         if (!svcs.empty()) selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
     };
 
+    auto stopLoader = [&]() {
+        loadCancel.store(true, std::memory_order_release);
+        if (loader.joinable()) loader.join();
+        loadCancel.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(catalog.mtx);
+            catalog.svcs.clear();
+            catalog.err.clear();
+        }
+        catalog.listReady.store(false, std::memory_order_release);
+        catalog.enrichDone.store(false, std::memory_order_release);
+        catalog.generation.store(0, std::memory_order_release);
+        seenGen = 0;
+    };
+
+    auto reload = [&](const std::string& newMsg = "") {
+        inDetails = false;
+        stopLiveStats();
+        stopLoader();
+        loader = std::thread([&]() { loadServicesProgressive(catalog, loadCancel); });
+
+        nodelay(stdscr, TRUE);
+        int f = 0;
+        while (!catalog.listReady.load(std::memory_order_acquire)) {
+            int W = 0, H = 0; getmaxyx(stdscr, H, W);
+            clear(); drawLoadingScreen(f++, W, H); refresh();
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+        nodelay(stdscr, FALSE);
+        applyCatalogSnapshot(false);
+        if (newMsg == "mode")
+            msg = std::string(g_systemMode ? "System" : "User") + " mode — " +
+                  std::to_string(svcs.size()) + " service(s).";
+        else if (newMsg == "Refreshed")
+            msg = "Refreshed — " + std::to_string(svcs.size()) + " service(s).";
+        else if (!newMsg.empty())
+            msg = newMsg;
+        else
+            msg = "Loaded " + std::to_string(svcs.size()) + " service(s).";
+        if (!catalog.enrichDone.load(std::memory_order_acquire))
+            msg += "  (loading details...)";
+    };
+
+    auto pinToggle = [&]() {
+        if (svcs.empty()) return;
+        const std::string u = svcs[selSvc].unit;
+        if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
+        else                   { g_pinned.insert(u); msg = "Pinned: "   + u; }
+        std::string pinErr;
+        if (!savePinned(&pinErr)) { err = pinErr; msg.clear(); }
+        else err.clear();
+        sortServices(svcs);
+        rows = buildRows(svcs);
+        for (int i = 0; i < (int)svcs.size(); ++i)
+            if (svcs[i].unit == u) { selSvc = i; break; }
+    };
+
     while (true) {
+        // Pull progressive enrich updates without blocking UI.
+        const uint64_t gen = catalog.generation.load(std::memory_order_acquire);
+        if (gen != seenGen && !inDetails)
+            applyCatalogSnapshot(msg.find("loading details") != std::string::npos ||
+                                 msg.find("Loaded ") == 0 ||
+                                 msg.find("Refreshed") == 0 ||
+                                 msg.find(" mode — ") != std::string::npos);
+
         int W = 0, H = 0;
         getmaxyx(stdscr, H, W);
 
@@ -1661,14 +1820,19 @@ int main(int argc, char* argv[]) {
         drawKeybindBar(H - 1, W, inDetails);
         refresh();
 
+        const bool enriching = !catalog.enrichDone.load(std::memory_order_acquire);
         if (inDetails)
             timeout(200);
+        else if (enriching)
+            timeout(100);
         else
             timeout(-1);
 
         int ch = getch();
-        if (ch == ERR && inDetails)
+        if (ch == ERR) {
+            if (inDetails || enriching) continue;
             continue;
+        }
 
         if (ch == 'q' || ch == 'Q') {
             if (inDetails) {
@@ -1685,15 +1849,14 @@ int main(int argc, char* argv[]) {
             inDetails = false;
             stopLiveStats();
             selSvc = 0;
-            reload(std::string(g_systemMode ? "System" : "User") + " mode — " +
-                   std::to_string(svcs.size()) + " service(s).");
+            reload("mode");
             if (!svcs.empty()) selSvc = nextSvc(rows, 0, 0);
             continue;
         }
 
         // Refresh
         if (ch == 'u' || ch == 'U') {
-            reload("Refreshed — " + std::to_string(svcs.size()) + " service(s).");
+            reload("Refreshed");
             continue;
         }
 
@@ -1722,15 +1885,7 @@ int main(int argc, char* argv[]) {
                     msg = "Find: " + svcs[selSvc].unit;
             }
             else if (ch == 'p' || ch == 'P') {
-                const std::string& u = svcs[selSvc].unit;
-                if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
-                else                   { g_pinned.insert(u); msg = "Pinned: "   + u; }
-                std::string pinErr;
-                if (!savePinned(&pinErr)) { err = pinErr; msg.clear(); }
-                else err.clear();
-                svcs = loadServices(err);
-                rows = buildRows(svcs);
-                selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
+                pinToggle();
             }
             else if (ch == 'c' || ch == 'C') {
                 openConsole(svcs[selSvc].unit);
@@ -1748,15 +1903,7 @@ int main(int argc, char* argv[]) {
                 stopLiveStats();
             }
             else if (ch == 'p' || ch == 'P') {
-                const std::string& u = svcs[selSvc].unit;
-                if (g_pinned.count(u)) { g_pinned.erase(u);  msg = "Unpinned: " + u; }
-                else                   { g_pinned.insert(u); msg = "Pinned: "   + u; }
-                std::string pinErr;
-                if (!savePinned(&pinErr)) { err = pinErr; msg.clear(); }
-                else err.clear();
-                svcs = loadServices(err);
-                rows = buildRows(svcs);
-                selSvc = std::clamp(selSvc, 0, (int)svcs.size() - 1);
+                pinToggle();
             }
             else if (ch == 'c' || ch == 'C') {
                 openConsole(svcs[selSvc].unit);
@@ -1772,6 +1919,7 @@ int main(int argc, char* argv[]) {
     }
 
     stopLiveStats();
+    stopLoader();
     endwin();
     return 0;
 }
