@@ -5,20 +5,20 @@ Codename: stable
 Architectures: amd64
 Components: main
 Description: mdsys apt repository
-Date: Thu, 13 Aug 2026 03:57:21 +0000
+Date: Thu, 13 Aug 2026 14:24:52 +0000
 MD5Sum:
- defa9f78d518ba1d0b9edff981cdfdab             5939 Packages
- aa9f9f728ddb694e79495099082b5202             1364 Packages.gz
- 4591cf0cd7e2e08e258ed0a8222b325e              168 Release
+ 1ab05fbf86a818c070d2e433a822e668             6598 Packages
+ f9856ae59783734908e3f65c57232798             1467 Packages.gz
+ 7deaa3c41c8feace146cbacc17d6a2f6              168 Release
 SHA1:
- 075698895a4ba2a178b611f6f3136e91576d2bce             5939 Packages
- 0f6818c2743623afce27b8192499c3c3954afa0a             1364 Packages.gz
- 27dd7ac1151365ba05bf1942a3189d5c5d2a179e              168 Release
+ df42697e78801b504dc460ac4b52e25195402d39             6598 Packages
+ 54a08723bf0c71f9138b8ecb83b66aa52c6c07e7             1467 Packages.gz
+ f1a108067d39b9346eeff44b73fad91549b876da              168 Release
 SHA256:
- d116475a68ed6d2d005874ac48d49371ea3ccfa83f67c2af4d1a73674145a8d8             5939 Packages
- ee81b773845dc07ae805911dc2dea250483bf98ca160fc009c6abe91531e20ad             1364 Packages.gz
- 1370b979df233fa44ed9e6ca19343aebcda8940bdd2cff03c92ab8fcab2629e3              168 Release
+ 8256da4c050a27e47cbc924d0c02855877d71fcd10a7f34303319240fe5ebccf             6598 Packages
+ 3e707367e96e1d84a84becbadbaa7cd2037c0441fefbbb110a6ead23000facb6             1467 Packages.gz
+ 163f7744879a3d93a5da0502b36e7028223dc2d04944ebf88f0f72a07864eb36              168 Release
 SHA512:
- 39be62ee0ffa3a54ec1882565ed508fe0ebfaaa897c121b3d10344974be95106f1728e25c79d3ff868ed3b260ed9db76e304c9895ee1b474ac511d2ae5cc5352             5939 Packages
- 0dda07f41e6cfc3c53b2dccf36400b83347e6675d2338000c33704f5799ea864789d6d79d810a5e89008b50c5022f9330d85c88d52a5ffd4415bc7ffc0a85c12             1364 Packages.gz
- ab55ac70b7db55ca1d0334e980cf6598e49a1fdc19186141345d53862b6a9d8fa859b692d4fae12dc4f1d1072d38df091ecfc49574fa25370e7c62e68907cc57              168 Release
+ fb3f3e352ec4331d7202ecbde9e76988dd760b9527580dd82a0aa8a871df0f2c754a33f277732232513b0b99b77a2b01df99ae75c4848435463d83f64e683240             6598 Packages
+ d275419d4b2ed4833908784e958eada16bb41415ab0d93fc0e0e29ed8ad34d25c22ecd9a01de237b18899c387128b12d2fec8d0a0a88ebb0cba71ca1474635ab             1467 Packages.gz
+ 6f632e2add186eb3b21805d5a599f03f35bf0c32081de560fc1132489ff7fd4a02cf3477db6f2a52aa2ff021ef5ac4f01573532f0fbb6d7413bf26ed7d85dfd2              168 Release
