@@ -771,8 +771,8 @@ static void drawTitleBar(int width) {
 static void drawKeybindBar(int row, int width, bool inDetails) {
     attron(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
     std::string kb = inDetails
-        ? "  ENTER/Q:back  R:restart  S:start  K:stop  P:pin  C:console  TAB:mode  U:refresh  ?:help"
-        : "  UP/DOWN:select  ENTER:details  F:find  R/S/K  P:pin  C:console  TAB:mode  U:refresh  Q:quit  ?:help";
+        ? "  ENTER/Q:back  R:restart  S:start  K:stop  P:pin  C:console  V:live  TAB:mode  U:refresh  ?:help"
+        : "  UP/DOWN:select  ENTER:details  F:find  R/S/K  P:pin  C:console  V:live  TAB:mode  U:refresh  Q:quit  ?:help";
     mvprintw(row, 0, "%-*s", width, kb.c_str());
     attroff(COLOR_PAIR(CP_KEYBINDS) | A_BOLD);
 }
@@ -1142,6 +1142,7 @@ static void runHelpDialog(bool /*inDetails*/) {
     lines.push_back("  R  S  K          restart / start / stop");
     lines.push_back("  P                pin / unpin service");
     lines.push_back("  C                console log (journalctl)");
+    lines.push_back("  V                live console (follow, journalctl -f)");
     lines.push_back("  Tab              toggle system / user mode");
     lines.push_back("  U                refresh service list");
     lines.push_back("  Q                quit");
@@ -1151,6 +1152,7 @@ static void runHelpDialog(bool /*inDetails*/) {
     lines.push_back("  R  S  K          restart / start / stop");
     lines.push_back("  P                pin / unpin");
     lines.push_back("  C                console log");
+    lines.push_back("  V                live console (follow)");
     lines.push_back("  Tab / U          mode toggle / refresh");
     lines.push_back("  Charts           live CPU & RAM (0.2s)");
     lines.push_back("");
@@ -1245,13 +1247,31 @@ static void runHelpDialog(bool /*inDetails*/) {
 }
 
 // ---------------------------------------------------------------------------
-// Console log viewer  (suspends ncurses, runs journalctl | less, restores)
+// Console log viewers  (suspend ncurses, run journalctl | less, restore)
+//   C = snapshot console (less -R +G)
+//   V = live/follow console (less -R +F)
 // ---------------------------------------------------------------------------
 static void openConsole(const std::string& unit) {
     // Build journalctl command.  System mode uses no --user flag.
     // less -R: ANSI colours; +G: open scrolled to the bottom (newest lines).
     std::string jcmd = pfx() + "journalctl " + flag() +
                        "-u " + shellQ(unit) + " -n 500 --no-pager 2>&1 | less -R +G";
+
+    def_prog_mode();   // save ncurses terminal state
+    endwin();          // restore normal terminal
+
+    system(jcmd.c_str());
+
+    reset_prog_mode(); // restore ncurses state
+    refresh();         // repaint
+}
+
+static void openLiveConsole(const std::string& unit) {
+    // Follow mode: less -R +F opens in "follow" (tail -f style). New lines
+    // stream in continuously. q/ESC detaches (Ctrl-C stops follow but keeps
+    // browsing); useful to inspect service logs in real time.
+    std::string jcmd = pfx() + "journalctl " + flag() +
+                       "-u " + shellQ(unit) + " -f -n 500 --no-pager 2>&1 | less -R +F";
 
     def_prog_mode();   // save ncurses terminal state
     endwin();          // restore normal terminal
@@ -1890,6 +1910,9 @@ int main(int argc, char* argv[]) {
             else if (ch == 'c' || ch == 'C') {
                 openConsole(svcs[selSvc].unit);
             }
+            else if (ch == 'v' || ch == 'V') {
+                openLiveConsole(svcs[selSvc].unit);
+            }
             else if (ch == 'r' || ch == 'R' || ch == 's' || ch == 'S' || ch == 'k' || ch == 'K') {
                 std::string act = (ch=='r'||ch=='R') ? "restart" : (ch=='s'||ch=='S') ? "start" : "stop";
                 int ec = doAction(svcs[selSvc].unit, act);
@@ -1907,6 +1930,9 @@ int main(int argc, char* argv[]) {
             }
             else if (ch == 'c' || ch == 'C') {
                 openConsole(svcs[selSvc].unit);
+            }
+            else if (ch == 'v' || ch == 'V') {
+                openLiveConsole(svcs[selSvc].unit);
             }
             else if (ch == 'r' || ch == 'R' || ch == 's' || ch == 'S' || ch == 'k' || ch == 'K') {
                 std::string act = (ch=='r'||ch=='R') ? "restart" : (ch=='s'||ch=='S') ? "start" : "stop";
