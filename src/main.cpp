@@ -736,6 +736,57 @@ static int doAction(const std::string& unit, const std::string& action) {
 }
 
 // ---------------------------------------------------------------------------
+// Dangerous actions  (Ctrl+R remove, Ctrl+E edit) — documented only in ? / README
+// ---------------------------------------------------------------------------
+static std::string getFragmentPath(const std::string& unit) {
+    return trim(runCmd(pfx() + "systemctl " + flag() + "show " + shellQ(unit) +
+                       " -p FragmentPath --value 2>/dev/null"));
+}
+
+// Stops + disables the unit, deletes its unit file, reloads systemd,
+// and drops the pin. Returns shell exit code (0 = ok); *errText has detail.
+static int removeService(const std::string& unit, std::string* errText) {
+    int ec = 0;
+
+    runCmd(pfx() + "systemctl " + flag() + "disable --now " + shellQ(unit) + " 2>&1", &ec);
+    if (ec != 0) { if (errText) *errText = "disable --now failed (exit " + std::to_string(ec) + ")"; return ec; }
+
+    const std::string fpath = getFragmentPath(unit);
+    if (!fpath.empty()) {
+        runCmd(pfx() + "rm -f " + shellQ(fpath) + " 2>&1", &ec);
+        if (ec != 0) { if (errText) *errText = "could not remove unit file"; return ec; }
+    }
+
+    runCmd(pfx() + "systemctl " + flag() + "daemon-reload 2>&1", &ec);
+    if (ec != 0) { if (errText) *errText = "daemon-reload failed (exit " + std::to_string(ec) + ")"; return ec; }
+
+    if (errText) errText->clear();
+    return 0;
+}
+
+// Runs the unit's config file fragment through the user-chosen editor.
+// Suspends ncurses (like the console viewer), restores on exit.
+// Returns a status message for the caller to display.
+static std::string editServiceConfig(const std::string& unit, const std::string& editor) {
+    const std::string fpath = getFragmentPath(unit);
+    if (fpath.empty()) return "No unit file for " + unit;
+
+    def_prog_mode();
+    endwin();
+
+    const std::string shellEditor = editor.empty() ? "nano" : editor;
+    const std::string fullCmd = shellEditor + " " + shellQ(fpath);
+    system(fullCmd.c_str());
+
+    reset_prog_mode();
+    refresh();
+
+    // Editor may have changed the config: reload systemd so the UI refreshes.
+    runCmd(pfx() + "systemctl " + flag() + "daemon-reload 2>/dev/null");
+    return "Edited " + unit;
+}
+
+// ---------------------------------------------------------------------------
 // Display rows (category headers + service rows interleaved)
 // ---------------------------------------------------------------------------
 enum class RowKind { Header, Service };
@@ -1161,6 +1212,10 @@ static void runHelpDialog(bool /*inDetails*/) {
     lines.push_back("  UP/DOWN          select match");
     lines.push_back("  Enter            jump to service");
     lines.push_back("  Esc              cancel");
+    lines.push_back("");
+    lines.push_back("Dangerous (use with care)");
+    lines.push_back("  Ctrl+R           remove service (stops, disables, deletes unit)");
+    lines.push_back("  Ctrl+E           edit service config (default nano)");
 
     WINDOW* win = nullptr;
     int dlgW = 0, dlgH = 0, scroll = 0;
@@ -1283,8 +1338,122 @@ static void openLiveConsole(const std::string& unit) {
 }
 
 // ---------------------------------------------------------------------------
-// Loading screen (animated, runs while background thread loads services)
+// Dangerous-action dialogs  (Ctrl+R remove, Ctrl+E edit)
 // ---------------------------------------------------------------------------
+// Simple centered yes/no confirmation. Returns true when the user confirms.
+static bool runConfirmDialog(const std::string& title, const std::string& message) {
+    timeout(-1);
+    curs_set(0);
+
+    int scrH = 0, scrW = 0;
+    getmaxyx(stdscr, scrH, scrW);
+    const int dlgW = std::clamp(std::min(scrW - 4, 72), 36, std::max(36, scrW - 2));
+    const int dlgH = std::clamp(std::min(scrH - 2, 12), 8, std::max(8, scrH - 2));
+    const int dlgY = (scrH - dlgH) / 2;
+    const int dlgX = (scrW - dlgW) / 2;
+
+    WINDOW* win = newwin(dlgH, dlgW, dlgY, dlgX);
+    keypad(win, TRUE);
+
+    bool confirmed = false;
+    for (bool running = true; running; ) {
+        werase(win);
+        box(win, 0, 0);
+
+        wattron(win, COLOR_PAIR(CP_ERR) | A_BOLD);
+        mvwprintw(win, 1, 2, " %s ", title.c_str());
+        wattroff(win, COLOR_PAIR(CP_ERR) | A_BOLD);
+
+        for (int i = 2; i < dlgW - 1; ++i)
+            mvwaddch(win, 3, i, ACS_HLINE | COLOR_PAIR(CP_CHART_GRID) | A_DIM);
+
+        // Wrap the message so it never overflows the centered box.
+        int row = 4;
+        std::string text = message;
+        const int maxCols = dlgW - 4;
+        while (!text.empty() && row < dlgH - 3) {
+            std::size_t take = text.size() > (std::size_t)maxCols ? (std::size_t)maxCols : text.size();
+            mvwprintw(win, row, 2, "%-*s", maxCols, text.substr(0, take).c_str());
+            text.erase(0, take);
+            ++row;
+        }
+
+        wattron(win, A_BOLD);
+        mvwprintw(win, dlgH - 2, 2, " Y:confirm   N/Esc:cancel ");
+        wattroff(win, A_BOLD);
+        wrefresh(win);
+
+        const int ch = wgetch(win);
+        if (ch == KEY_RESIZE) { touchwin(stdscr); continue; }
+        if (ch == 'y' || ch == 'Y' || ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) {
+            confirmed = true;
+            running = false;
+        } else if (ch == 'n' || ch == 'N' || ch == 27 || ch == 'q' || ch == 'Q') {
+            running = false;
+        }
+    }
+
+    delwin(win);
+    touchwin(stdscr);
+    curs_set(0);
+    return confirmed;
+}
+
+// Prompts for an editor (default nano), then edits the unit's config file.
+// Returns a status message, or an empty string if cancelled.
+static std::string runEditorDialog(const std::string& unit) {
+    timeout(-1);
+    curs_set(1);
+
+    int scrH = 0, scrW = 0;
+    getmaxyx(stdscr, scrH, scrW);
+    const int dlgW = std::clamp(std::min(scrW - 4, 64), 36, std::max(36, scrW - 2));
+    const int dlgH = std::clamp(std::min(scrH - 2, 9), 7, std::max(7, scrH - 2));
+    const int dlgY = (scrH - dlgH) / 2;
+    const int dlgX = (scrW - dlgW) / 2;
+
+    WINDOW* win = newwin(dlgH, dlgW, dlgY, dlgX);
+    keypad(win, TRUE);
+
+    std::string editor = "nano";
+    bool cancelled = false;
+
+    for (bool running = true; running; ) {
+        werase(win);
+        box(win, 0, 0);
+
+        wattron(win, COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+        mvwprintw(win, 1, 2, " Edit %-*s ", dlgW - 14, unit.c_str());
+        wattroff(win, COLOR_PAIR(CP_DETAIL_KEY) | A_BOLD);
+
+        mvwprintw(win, 3, 2, "Editor (default nano):");
+        mvwprintw(win, 4, 2, "> %-*s", dlgW - 6, editor.c_str());
+        wmove(win, 4, 4 + (int)editor.size());
+
+        wattron(win, COLOR_PAIR(CP_KEYBINDS) | A_DIM);
+        mvwprintw(win, dlgH - 2, 2, "ENTER:ok   ESC:cancel");
+        wattroff(win, COLOR_PAIR(CP_KEYBINDS) | A_DIM);
+        wrefresh(win);
+
+        const int ch = wgetch(win);
+        if (ch == KEY_RESIZE) { touchwin(stdscr); continue; }
+        if (ch == 27)                 { cancelled = true; running = false; }
+        else if (ch == '\n' || ch == KEY_ENTER || ch == 10 || ch == 13) running = false;
+        else if (ch == 8 || ch == 127 || ch == KEY_BACKSPACE) {
+            if (!editor.empty()) editor.pop_back();
+        } else if (ch >= 32 && ch < 127 && (int)editor.size() < dlgW - 10) {
+            editor += (char)ch;
+        }
+    }
+
+    delwin(win);
+    touchwin(stdscr);
+    curs_set(0);
+
+    if (cancelled) return std::string();          // user escapes the prompt
+    return editServiceConfig(unit, trim(editor)); // empty editor -> nano
+}
+
 static void drawLoadingScreen(int frame, int W, int H) {
     // Spinner chars
     static const char* spin = "|/-\\";
@@ -1913,6 +2082,36 @@ int main(int argc, char* argv[]) {
             else if (ch == 'v' || ch == 'V') {
                 openLiveConsole(svcs[selSvc].unit);
             }
+            // Ctrl+R (0x12) / Ctrl+E (0x05): dangerous actions (documented in ? / README only)
+            else if (ch == 18 /* Ctrl+R */) {
+                const std::string unit = svcs[selSvc].unit;
+                if (runConfirmDialog(" Remove service (DANGEROUS) ",
+                                     "This will stop, disable and delete the unit file for\n" +
+                                     unit + ".\n\nThis may break your system. Continue?")) {
+                    std::string rerr;
+                    int ec = removeService(unit, &rerr);
+                    g_pinned.erase(unit);
+                    std::string pinErr;
+                    savePinned(&pinErr);
+                    reload();
+                    if (ec != 0) {
+                        err = "Remove FAILED: " + rerr + " — " + unit;
+                    } else {
+                        err.clear();
+                        msg = "Removed service: " + unit;
+                        if (!pinErr.empty()) err = pinErr;
+                    }
+                }
+            }
+            else if (ch == 5 /* Ctrl+E */) {
+                const std::string unit = svcs[selSvc].unit;
+                std::string stat = runEditorDialog(unit);
+                if (!stat.empty()) {
+                    reload();
+                    err.clear();
+                    msg = stat;
+                }
+            }
             else if (ch == 'r' || ch == 'R' || ch == 's' || ch == 'S' || ch == 'k' || ch == 'K') {
                 std::string act = (ch=='r'||ch=='R') ? "restart" : (ch=='s'||ch=='S') ? "start" : "stop";
                 int ec = doAction(svcs[selSvc].unit, act);
@@ -1933,6 +2132,36 @@ int main(int argc, char* argv[]) {
             }
             else if (ch == 'v' || ch == 'V') {
                 openLiveConsole(svcs[selSvc].unit);
+            }
+            // Ctrl+R (0x12) / Ctrl+E (0x05): dangerous actions (documented in ? / README only)
+            else if (ch == 18 /* Ctrl+R */) {
+                const std::string unit = svcs[selSvc].unit;
+                if (runConfirmDialog(" Remove service (DANGEROUS) ",
+                                     "This will stop, disable and delete the unit file for\n" +
+                                     unit + ".\n\nThis may break your system. Continue?")) {
+                    std::string rerr;
+                    int ec = removeService(unit, &rerr);
+                    g_pinned.erase(unit);
+                    std::string pinErr;
+                    savePinned(&pinErr);
+                    reload();
+                    if (ec != 0) {
+                        err = "Remove FAILED: " + rerr + " — " + unit;
+                    } else {
+                        err.clear();
+                        msg = "Removed service: " + unit;
+                        if (!pinErr.empty()) err = pinErr;
+                    }
+                }
+            }
+            else if (ch == 5 /* Ctrl+E */) {
+                const std::string unit = svcs[selSvc].unit;
+                std::string stat = runEditorDialog(unit);
+                if (!stat.empty()) {
+                    reload();
+                    err.clear();
+                    msg = stat;
+                }
             }
             else if (ch == 'r' || ch == 'R' || ch == 's' || ch == 'S' || ch == 'k' || ch == 'K') {
                 std::string act = (ch=='r'||ch=='R') ? "restart" : (ch=='s'||ch=='S') ? "start" : "stop";

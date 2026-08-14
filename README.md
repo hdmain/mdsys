@@ -125,6 +125,15 @@ Charts refresh live every 0.2 s (CPU and RAM).
 | `Esc` | Cancel |
 | `Backspace` | Delete character |
 
+### Dangerous keys (use with care)
+
+These are intentionally hidden from the status bar. They are only documented here and in the `?` help dialog.
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+R` | Remove selected service — stops, disables and deletes its unit file. Confirmation required; this can break your system. |
+| `Ctrl+E` | Edit the selected service's config file. Prompts for an editor (defaults to `nano`). |
+
 ## Features
 
 - Lists system or user services (`systemctl` / `systemctl --user`)
